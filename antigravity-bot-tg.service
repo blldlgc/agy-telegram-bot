@@ -1,0 +1,20 @@
+[Unit]
+Description=Antigravity Telegram Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=<YOUR_USERNAME>
+# Lưu ý: Thay đổi WorkingDirectory và ExecStart thành đường dẫn đúng tới thư mục chứa mã nguồn của bạn
+WorkingDirectory=/path/to/your/projects/antigravity-cli-telegram
+ExecStart=/path/to/your/projects/antigravity-cli-telegram/antigravity-cli-telegram
+Restart=always
+RestartSec=5
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=agy-telegram-bot
+# Set PATH explicitly if 'agy' command is not found. Replace <YOUR_USERNAME> accordingly.
+Environment="PATH=/usr/local/bin:/usr/bin:/bin:/home/<YOUR_USERNAME>/.local/bin:/home/<YOUR_USERNAME>/go/bin"
+
+[Install]
+WantedBy=multi-user.target
