@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestFormatTelegramHTML(t *testing.T) {
@@ -48,6 +49,30 @@ Inline code: ` + "`x < 10 && y > 20`"
 	}
 }
 
+func TestMarkdownTableConversion(t *testing.T) {
+	input := `Here is a table:
+| Feature | Status | Priority |
+| --- | :---: | ---: |
+| Auth | Done | High |
+| Queue | Active | Medium |`
+
+	res := FormatTelegramHTML(input)
+	if !strings.Contains(res, "• <b>Auth</b>") || !strings.Contains(res, "<i>Status:</i> Done") {
+		t.Errorf("Table not converted to mobile bullet list: %s", res)
+	}
+}
+
+func TestExpandableBlockquote(t *testing.T) {
+	var lines []string
+	for i := 0; i < 8; i++ {
+		lines = append(lines, "> Quote line")
+	}
+	res := FormatTelegramHTML(strings.Join(lines, "\n"))
+	if !strings.Contains(res, "<blockquote expandable>") {
+		t.Errorf("Expected expandable blockquote for >6 lines, got: %s", res)
+	}
+}
+
 func TestSplitTelegramHTML(t *testing.T) {
 	longCode := "```go\n" + strings.Repeat("x = x + 1\n", 500) + "```"
 	html := FormatTelegramHTML(longCode)
@@ -58,8 +83,24 @@ func TestSplitTelegramHTML(t *testing.T) {
 	}
 
 	for i, chunk := range chunks {
-		if strings.Contains(chunk, "<pre>") && !strings.Contains(chunk, "</pre>") {
-			t.Errorf("Chunk %d has unclosed <pre>", i)
+		if strings.Contains(chunk, "<pre><code") && !strings.Contains(chunk, "</code></pre>") {
+			t.Errorf("Chunk %d has unclosed <pre><code>: %s", i, chunk)
+		}
+		if strings.Contains(chunk, "</code></pre>") && !strings.Contains(chunk, "<pre><code") {
+			t.Errorf("Chunk %d has unmatched </code></pre>: %s", i, chunk)
+		}
+	}
+}
+
+func TestSplitLongSingleLine(t *testing.T) {
+	hugeLine := strings.Repeat("word ", 400) // ~2000 chars on a single line
+	chunks := SplitTelegramHTML(hugeLine, 500)
+	if len(chunks) < 3 {
+		t.Errorf("Expected long single line to be split into >= 3 chunks, got %d", len(chunks))
+	}
+	for i, c := range chunks {
+		if utf8.RuneCountInString(c) > 500 {
+			t.Errorf("Chunk %d exceeds maxLen (len=%d)", i, utf8.RuneCountInString(c))
 		}
 	}
 }

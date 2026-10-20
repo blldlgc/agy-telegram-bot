@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,14 +58,41 @@ type PhotoSize struct {
 	FileSize int64  `json:"file_size,omitempty"`
 }
 
+type Voice struct {
+	FileID   string `json:"file_id"`
+	Duration int    `json:"duration,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	FileSize int64  `json:"file_size,omitempty"`
+}
+
+type Audio struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	Duration int    `json:"duration,omitempty"`
+	FileSize int64  `json:"file_size,omitempty"`
+}
+
+type Video struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	Duration int    `json:"duration,omitempty"`
+	FileSize int64  `json:"file_size,omitempty"`
+}
+
 type Message struct {
-	MessageID int64       `json:"message_id"`
-	From      *User       `json:"from"`
-	Chat      *Chat       `json:"chat"`
-	Text      string      `json:"text"`
-	Caption   string      `json:"caption,omitempty"`
-	Document  *Document   `json:"document,omitempty"`
-	Photo     []PhotoSize `json:"photo,omitempty"`
+	MessageID      int64       `json:"message_id"`
+	From           *User       `json:"from"`
+	Chat           *Chat       `json:"chat"`
+	Text           string      `json:"text"`
+	Caption        string      `json:"caption,omitempty"`
+	Document       *Document   `json:"document,omitempty"`
+	Photo          []PhotoSize `json:"photo,omitempty"`
+	Voice          *Voice      `json:"voice,omitempty"`
+	Audio          *Audio      `json:"audio,omitempty"`
+	Video          *Video      `json:"video,omitempty"`
+	ReplyToMessage *Message    `json:"reply_to_message,omitempty"`
 }
 
 type User struct {
@@ -109,8 +138,12 @@ type CallbackQuery struct {
 
 type APIResponse struct {
 	Ok          bool            `json:"ok"`
+	ErrorCode   int             `json:"error_code,omitempty"`
 	Result      json.RawMessage `json:"result,omitempty"`
 	Description string          `json:"description,omitempty"`
+	Parameters  *struct {
+		RetryAfter int `json:"retry_after,omitempty"`
+	} `json:"parameters,omitempty"`
 }
 
 // SetMyCommands sets the bot menu commands
@@ -166,12 +199,13 @@ func (b *TelegramBot) GetMe() (*User, error) {
 
 // ConfirmUpdates acknowledges processed updates on Telegram servers before shutdown/restart
 func (b *TelegramBot) ConfirmUpdates() {
-	if b.offset == 0 {
+	curOffset := atomic.LoadInt64(&b.offset)
+	if curOffset == 0 {
 		return
 	}
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates", b.Token)
 	payload := map[string]interface{}{
-		"offset":  b.offset,
+		"offset":  curOffset,
 		"timeout": 0,
 		"limit":   1,
 	}
@@ -186,8 +220,9 @@ func (b *TelegramBot) ConfirmUpdates() {
 func (b *TelegramBot) GetUpdates() ([]Update, error) {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates", b.Token)
 
+	curOffset := atomic.LoadInt64(&b.offset)
 	payload := map[string]interface{}{
-		"offset":  b.offset,
+		"offset":  curOffset,
 		"timeout": 30, // 30 seconds long polling
 	}
 	body, _ := json.Marshal(payload)
@@ -207,14 +242,62 @@ func (b *TelegramBot) GetUpdates() ([]Update, error) {
 		return nil, fmt.Errorf("telegram API returned ok=false: %s", apiResp.Description)
 	}
 
-	// Update offset to highest update_id + 1
+	// Update offset to highest update_id + 1 atomically
 	for _, u := range apiResp.Result {
-		if u.UpdateID >= b.offset {
-			b.offset = u.UpdateID + 1
+		if u.UpdateID >= curOffset {
+			curOffset = u.UpdateID + 1
+			atomic.StoreInt64(&b.offset, curOffset)
 		}
 	}
 
 	return apiResp.Result, nil
+}
+
+// postMessageJSON posts a JSON request to Telegram and handles 429 rate-limit retries automatically
+func (b *TelegramBot) postMessageJSON(endpoint string, payload map[string]interface{}) (*Message, error) {
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", b.Token, endpoint)
+
+	for attempt := 0; attempt < 2; attempt++ {
+		body, _ := json.Marshal(payload)
+		resp, err := b.client.Post(url, "application/json", bytes.NewBuffer(body))
+		if err != nil {
+			return nil, err
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var apiResp struct {
+			Ok          bool     `json:"ok"`
+			ErrorCode   int      `json:"error_code"`
+			Result      *Message `json:"result"`
+			Description string   `json:"description"`
+			Parameters  *struct {
+				RetryAfter int `json:"retry_after"`
+			} `json:"parameters"`
+		}
+		if err := json.Unmarshal(respBody, &apiResp); err != nil {
+			return nil, err
+		}
+		if apiResp.Ok {
+			return apiResp.Result, nil
+		}
+
+		// Handle HTTP 429 rate limits gracefully
+		if apiResp.ErrorCode == 429 && apiResp.Parameters != nil && apiResp.Parameters.RetryAfter > 0 && apiResp.Parameters.RetryAfter <= 15 && attempt == 0 {
+			waitDur := time.Duration(apiResp.Parameters.RetryAfter) * time.Second
+			log.Printf("⏳ Telegram rate limit on %s, retrying after %v...", endpoint, waitDur)
+			time.Sleep(waitDur)
+			continue
+		}
+
+		if !strings.Contains(apiResp.Description, "message is not modified") {
+			log.Printf("⚠️ Telegram %s failed: %s", endpoint, apiResp.Description)
+		}
+		return nil, fmt.Errorf("telegram %s failed: %s", endpoint, apiResp.Description)
+	}
+
+	return nil, fmt.Errorf("telegram %s failed after retry", endpoint)
 }
 
 // SendMessage sends a text message to a specific chat with persistent reply keyboard
@@ -224,8 +307,6 @@ func (b *TelegramBot) SendMessage(chatID int64, text string, parseMode ...string
 
 // SendMessageWithMarkup sends a text message with optional reply markup (inline keyboard)
 func (b *TelegramBot) SendMessageWithMarkup(chatID int64, text string, markup interface{}, parseMode ...string) (*Message, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", b.Token)
-
 	payload := map[string]interface{}{
 		"chat_id": chatID,
 		"text":    text,
@@ -236,35 +317,11 @@ func (b *TelegramBot) SendMessageWithMarkup(chatID int64, text string, markup in
 	if markup != nil {
 		payload["reply_markup"] = markup
 	}
-	body, _ := json.Marshal(payload)
-
-	resp, err := b.client.Post(url, "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	var apiResp struct {
-		Ok          bool     `json:"ok"`
-		Result      *Message `json:"result"`
-		Description string   `json:"description"`
-	}
-	if err := json.Unmarshal(respBody, &apiResp); err != nil {
-		return nil, err
-	}
-	if !apiResp.Ok {
-		log.Printf("⚠️ Telegram SendMessage failed: %s", apiResp.Description)
-		return nil, fmt.Errorf("telegram SendMessage failed: %s", apiResp.Description)
-	}
-
-	return apiResp.Result, nil
+	return b.postMessageJSON("sendMessage", payload)
 }
 
 // EditMessageText edits an existing message text
 func (b *TelegramBot) EditMessageText(chatID int64, messageID int64, text string, markup interface{}, parseMode ...string) (*Message, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/editMessageText", b.Token)
-
 	payload := map[string]interface{}{
 		"chat_id":    chatID,
 		"message_id": messageID,
@@ -276,29 +333,7 @@ func (b *TelegramBot) EditMessageText(chatID int64, messageID int64, text string
 	if markup != nil {
 		payload["reply_markup"] = markup
 	}
-	body, _ := json.Marshal(payload)
-
-	resp, err := b.client.Post(url, "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	var apiResp struct {
-		Ok          bool     `json:"ok"`
-		Result      *Message `json:"result"`
-		Description string   `json:"description"`
-	}
-	if err := json.Unmarshal(respBody, &apiResp); err != nil {
-		return nil, err
-	}
-	if !apiResp.Ok {
-		log.Printf("⚠️ Telegram EditMessageText failed: %s", apiResp.Description)
-		return nil, fmt.Errorf("telegram EditMessageText failed: %s", apiResp.Description)
-	}
-
-	return apiResp.Result, nil
+	return b.postMessageJSON("editMessageText", payload)
 }
 
 // DeleteMessage deletes a message
@@ -339,7 +374,7 @@ func (b *TelegramBot) AnswerCallbackQuery(callbackQueryID string, text string) e
 	return nil
 }
 
-// SendChatAction sends a typing indicator
+// SendChatAction sends a typing or upload indicator
 func (b *TelegramBot) SendChatAction(chatID int64, action string) error {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendChatAction", b.Token)
 
@@ -415,8 +450,8 @@ func (b *TelegramBot) DownloadFile(filePath string, destPath string) error {
 	return err
 }
 
-// SendDocument uploads and sends a local file as a Telegram document
-func (b *TelegramBot) SendDocument(chatID int64, filePath string, caption string) (*Message, error) {
+// sendMultipartFile uploads a local file to a Telegram endpoint (sendDocument or sendPhoto)
+func (b *TelegramBot) sendMultipartFile(chatID int64, endpoint string, fieldName string, filePath string, caption string) (*Message, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
@@ -434,7 +469,7 @@ func (b *TelegramBot) SendDocument(chatID int64, filePath string, caption string
 		_ = writer.WriteField("parse_mode", "HTML")
 	}
 
-	part, err := writer.CreateFormFile("document", filepath.Base(filePath))
+	part, err := writer.CreateFormFile(fieldName, filepath.Base(filePath))
 	if err != nil {
 		return nil, err
 	}
@@ -445,7 +480,7 @@ func (b *TelegramBot) SendDocument(chatID int64, filePath string, caption string
 		return nil, err
 	}
 
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", b.Token)
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", b.Token, endpoint)
 	req, err := http.NewRequest("POST", url, &body)
 	if err != nil {
 		return nil, err
@@ -467,7 +502,37 @@ func (b *TelegramBot) SendDocument(chatID int64, filePath string, caption string
 		return nil, err
 	}
 	if !apiResp.Ok {
-		return nil, fmt.Errorf("sendDocument error: %s", apiResp.Description)
+		return nil, fmt.Errorf("%s error: %s", endpoint, apiResp.Description)
 	}
 	return apiResp.Result, nil
+}
+
+// SendDocument uploads and sends a local file as a Telegram document
+func (b *TelegramBot) SendDocument(chatID int64, filePath string, caption string) (*Message, error) {
+	return b.sendMultipartFile(chatID, "sendDocument", "document", filePath, caption)
+}
+
+// SendPhoto uploads and sends a local image file as an inline Telegram photo, falling back to SendDocument
+func (b *TelegramBot) SendPhoto(chatID int64, filePath string, caption string) (*Message, error) {
+	msg, err := b.sendMultipartFile(chatID, "sendPhoto", "photo", filePath, caption)
+	if err != nil {
+		return b.SendDocument(chatID, filePath, caption)
+	}
+	return msg, nil
+}
+
+// SendFileAuto sends images (<10MB) as inline photos and all other files as documents
+func (b *TelegramBot) SendFileAuto(chatID int64, filePath string, caption string) (*Message, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return nil, err
+	}
+	ext := strings.ToLower(filepath.Ext(filePath))
+	if info.Size() > 0 && info.Size() < 10*1024*1024 {
+		switch ext {
+		case ".jpg", ".jpeg", ".png", ".webp":
+			return b.SendPhoto(chatID, filePath, caption)
+		}
+	}
+	return b.SendDocument(chatID, filePath, caption)
 }

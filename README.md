@@ -29,28 +29,36 @@ By bridging Antigravity CLI with **Telegram**, this project unlocks the ability 
 - **Absolute Security**: API calls are made directly via standard `net/http` without 3rd-party wrappers.
 - **Sandbox Security 🛡️**: Restricts the AI to read/write files strictly within authorized directories (`ALLOWED_DIRS`).
 - **Access Control (Whitelist)**: Only responds to authorized Telegram user IDs or group chat IDs.
-- **Real-Time Step History & Push Alerts ⚡**: Streams a live checklist of completed (`✅`) and active (`⚡ Running:`) tool steps into Telegram, and delivers the final response as a new message to guarantee mobile push notifications and vibration.
-- **Smart Message Queueing 📥**: Send follow-up prompts even while the bot is busy—messages are automatically queued and executed in order, with inline buttons to `[⚡ Interrupt & Run Now]` or `[🗑️ Clear Queue]`.
-- **Instant Git Dashboard 🌿**: Check repository status, unstaged diff stats, recent commits, and trigger `git pull` instantaneously via `/git` without waiting for an LLM turn.
+- **Real-Time Step History, Live Cancel & Push Alerts ⚡**: Streams a live checklist of completed (`✅`) and active (`⚡`) tool steps with elapsed timer (`⏱️`) and an inline `[🛑 Cancel Task]` button right on the progress card, delivering the final response as a new message to guarantee mobile push notifications.
+- **Persistent Session State (`.sessions.json`) 💾**: Automatically saves and restores each user's active working directory and conversation ID across bot restarts or server reboots.
+- **Smart Message Queueing 📥**: Send follow-up prompts even while the bot is busy—messages are automatically queued and executed in order, with inline buttons to `[⚡ Interrupt & Run Now]` or `[🗑️ Clear Queue]`, and a `/tasks` monitor.
+- **Instant Git Dashboard & 1-Tap AI Code Review 🌿**: Check repository status, staged & unstaged diff stats, ahead/behind counts, recent commits, `git pull`, or trigger an AI code review via `/git` or `/review`.
+- **Interactive System & Server Health Dashboard 🖥️**: Monitor real-time RAM, CPU load, disk usage progress bars, battery level/temperature, and bot uptime via `/server`.
+- **Paginated Directory & File Browser 📂📄**: Navigate any number of folders with pagination (`/dir`) and browse/download files in the current directory with a single tap (`/files`).
+- **Multimodal File, Photo, Voice & Audio Support 🖼️🎙️📁**: Upload source code, documents (with 1-tap Analyze/Fix/Summarize buttons or next-message auto-attachment), screenshots/photos, or voice/audio/video messages directly via Telegram, and receive generated images as inline photos or files as documents.
+- **Swipe-to-Reply Context & Interactive Question Buttons 💬**: Swipe-to-reply on any earlier message to automatically include its quoted context, and answer `ask_question` prompts via 1-tap inline buttons.
 - **Continuous Typing Indicator ✍️**: Maintains active typing status during lengthy reasoning turns.
 - **Dynamic AI Model Switcher 🧠**: Switch models (`Gemini 3.8 Flash`, `Gemini 4 Argon`, `Claude Sonnet/Opus`) on the fly via `/model` with inline buttons.
-- **Bi-Directional File, Photo & Auto-Attachment Support 🖼️📁**: Upload source code, documents, or screenshots/photos directly via Telegram for the AI agent to inspect, download server files via `/getfile <path>`, or let the agent automatically deliver generated PDFs, reports, and images to your chat.
-- **Persistent Mobile Reply Keyboard 📱**: Quick bottom buttons (`Status`, `Dir`, `Model`, `Continue`, `Resume`, `New`, `Git`, `Cancel`) designed for seamless phone ergonomics.
-- **Instant Task Cancellation 🛑**: Stop long-running or stuck tasks immediately with `/cancel` or `/stop`.
-- **Interactive Session Management 💬**: Browse recent conversations with message previews from the SQLite/transcript store and resume sessions interactively via inline buttons (`/resume`).
-- **Interactive Directory Browser 📂**: Navigate folders and switch working directories using interactive inline keyboards (`/dir`).
-- **Robust Markdown/HTML Formatting**: Custom tag-preserving parser and chunker that safely handles code blocks, nested tags, and message splits without Telegram parse errors.
+- **Persistent Mobile Reply Keyboard 📱**: Quick bottom buttons (`Status`, `Dir`, `Model`, `Continue`, `Resume`, `New`, `Git`, `Server`, `Cancel`) designed for seamless phone ergonomics.
+- **Process-Group Safe Task Cancellation 🛑**: Stops both the `agy` process and its entire child process tree (`-pgid`) immediately with `/cancel` or the inline cancel button.
+- **Interactive Session Management 💬**: Browse recent conversations with pagination, active-session badges, and message previews from the SQLite/transcript store (`/resume`).
+- **Robust Markdown/HTML Formatting**: Custom tag-preserving parser and chunker that safely handles `<pre><code>` blocks, long single lines, expandable blockquotes, and automatic Markdown table-to-bullet conversion for mobile screens.
 - **Slash Commands**:
+    - `/status`: Interactive bot status, active step, git branch, and quick-action dashboard.
+    - `/dir`: Paginated folder explorer to switch working directories.
+    - `/files`: Browse and 1-tap download files in the current working directory.
     - `/model`: Select and switch active AI model interactively.
-    - `/git`: Open interactive Git dashboard (status, diff, log, pull).
+    - `/git`: Interactive Git dashboard (status, staged/unstaged diff, log, pull, AI review).
+    - `/server`: System health dashboard (RAM, CPU load, disk, battery, uptime).
+    - `/review`: Run an AI code review on uncommitted Git changes.
+    - `/tasks`: Inspect active task progress and queued messages.
+    - `/compact`: Compress conversation context to save memory.
     - `/getfile <path>`: Download a file from server to Telegram.
     - `/new`: Reset session and start a clean conversation.
-    - `/resume`: List previous sessions with interactive buttons to switch.
+    - `/resume`: Paginated list of previous sessions with previews and active indicator.
     - `/continue`: Continue the previous task where it left off.
-    - `/dir`: Browse and change working directory via interactive buttons.
-    - `/status`: Display current AI model, active directory, conversation ID, and bot status.
-    - `/cancel` / `/stop`: Abort the currently executing task.
-    - `/restart`: Gracefully restart the bot service.
+    - `/cancel` / `/stop`: Abort the currently executing task and child processes.
+    - `/restart`: Save session state and gracefully restart the bot service.
     - `/goal <prompt>`: Execute an autonomous deep task in the background.
     - `/schedule <time> <prompt>`: Schedule a delayed or recurring task.
     - `/help`: Display help and command usage.

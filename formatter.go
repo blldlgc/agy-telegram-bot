@@ -8,15 +8,17 @@ import (
 )
 
 var (
-	reBold1   = regexp.MustCompile(`\*\*([^*]+)\*\*`)
-	reBold2   = regexp.MustCompile(`__([^_]+)__`)
-	reItalic1 = regexp.MustCompile(`(?m)(^|[^\*])\*([^\*\s][^\*]*[^\*\s]|[^\*\s])\*([^\*]|$)`)
-	reItalic2 = regexp.MustCompile(`(?m)(^|[^_])_([^_ \s][^_]*[^_ \s]|[^_ \s])_([^_]|$)`)
-	reStrike  = regexp.MustCompile(`~~([^~]+)~~`)
-	reLink    = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^\s\)]+)\)`)
-	reHeader  = regexp.MustCompile(`(?m)^#{1,6}\s*(.+)$`)
-	reBullet  = regexp.MustCompile(`(?m)^[\*\-]\s+(.+)$`)
-	reHTMLTag = regexp.MustCompile(`<[^>]+>`)
+	reBold1      = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	reBold2      = regexp.MustCompile(`__([^_]+)__`)
+	reItalic1    = regexp.MustCompile(`(?m)(^|[^\*])\*([^\*\s][^\*]*[^\*\s]|[^\*\s])\*([^\*]|$)`)
+	reItalic2    = regexp.MustCompile(`(?m)(^|[^_])_([^_ \s][^_]*[^_ \s]|[^_ \s])_([^_]|$)`)
+	reStrike     = regexp.MustCompile(`~~([^~]+)~~`)
+	reLink       = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^\s\)]+)\)`)
+	reHeader     = regexp.MustCompile(`(?m)^#{1,6}\s*(.+)$`)
+	reBullet     = regexp.MustCompile(`(?m)^[\*\-]\s+(.+)$`)
+	reHTMLTag    = regexp.MustCompile(`<[^>]+>`)
+	rePreCodeTag = regexp.MustCompile(`<pre><code[^>]*>`)
+	reTableSep   = regexp.MustCompile(`^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?\s*$`)
 )
 
 func escapeTelegram(s string) string {
@@ -24,6 +26,79 @@ func escapeTelegram(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	return s
+}
+
+// parseTableCells splits a Markdown table row into trimmed cell strings
+func parseTableCells(line string) []string {
+	line = strings.TrimSpace(line)
+	line = strings.TrimPrefix(line, "|")
+	line = strings.TrimSuffix(line, "|")
+	raw := strings.Split(line, "|")
+	cells := make([]string, 0, len(raw))
+	for _, c := range raw {
+		cells = append(cells, strings.TrimSpace(c))
+	}
+	return cells
+}
+
+// isTableRow checks if a line looks like a Markdown pipe-table row
+func isTableRow(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "|") || !strings.HasSuffix(trimmed, "|") {
+		return false
+	}
+	return strings.Count(trimmed, "|") >= 2
+}
+
+// convertMarkdownTables converts Markdown pipe tables into mobile-friendly bullet lists
+func convertMarkdownTables(text string) string {
+	lines := strings.Split(text, "\n")
+	var out []string
+	i := 0
+	for i < len(lines) {
+		if i+1 < len(lines) && isTableRow(lines[i]) && reTableSep.MatchString(lines[i+1]) {
+			headers := parseTableCells(lines[i])
+			i += 2 // skip header and separator
+			for i < len(lines) && isTableRow(lines[i]) {
+				if reTableSep.MatchString(lines[i]) {
+					i++
+					continue
+				}
+				cells := parseTableCells(lines[i])
+				if len(cells) == 0 {
+					i++
+					continue
+				}
+				if len(cells) == 1 {
+					out = append(out, fmt.Sprintf("• **%s**", cells[0]))
+				} else if len(cells) == 2 {
+					out = append(out, fmt.Sprintf("• **%s:** %s", cells[0], cells[1]))
+				} else {
+					var parts []string
+					for colIdx := 1; colIdx < len(cells); colIdx++ {
+						if cells[colIdx] == "" {
+							continue
+						}
+						if colIdx < len(headers) && headers[colIdx] != "" {
+							parts = append(parts, fmt.Sprintf("*%s:* %s", headers[colIdx], cells[colIdx]))
+						} else {
+							parts = append(parts, cells[colIdx])
+						}
+					}
+					if len(parts) > 0 {
+						out = append(out, fmt.Sprintf("• **%s** — %s", cells[0], strings.Join(parts, " · ")))
+					} else {
+						out = append(out, fmt.Sprintf("• **%s**", cells[0]))
+					}
+				}
+				i++
+			}
+			continue
+		}
+		out = append(out, lines[i])
+		i++
+	}
+	return strings.Join(out, "\n")
 }
 
 // FormatTelegramHTML converts Markdown to Telegram-safe HTML
@@ -77,6 +152,9 @@ func FormatTelegramHTML(text string) string {
 		return token
 	})
 
+	// 2.5 Convert any Markdown tables into mobile-friendly bullet points
+	text = convertMarkdownTables(text)
+
 	// 3. Escape normal text (<, >, &)
 	text = escapeTelegram(text)
 
@@ -109,7 +187,12 @@ func FormatTelegramHTML(text string) string {
 
 	flushQuote := func() {
 		if inQuote {
-			resultLines = append(resultLines, "<blockquote>"+strings.Join(quoteBuf, "\n")+"</blockquote>")
+			joined := strings.Join(quoteBuf, "\n")
+			if len(quoteBuf) > 6 || utf8.RuneCountInString(joined) > 450 {
+				resultLines = append(resultLines, "<blockquote expandable>"+joined+"</blockquote>")
+			} else {
+				resultLines = append(resultLines, "<blockquote>"+joined+"</blockquote>")
+			}
 			quoteBuf = nil
 			inQuote = false
 		}
@@ -138,40 +221,63 @@ func FormatTelegramHTML(text string) string {
 	return text
 }
 
+// splitLongLines ensures no single line exceeds maxLineLen runes without breaking HTML entities
+func splitLongLines(lines []string, maxLineLen int) []string {
+	if maxLineLen < 80 {
+		maxLineLen = 80
+	}
+	var result []string
+	for _, line := range lines {
+		if utf8.RuneCountInString(line) <= maxLineLen {
+			result = append(result, line)
+			continue
+		}
+		runes := []rune(line)
+		for len(runes) > maxLineLen {
+			cut := maxLineLen
+			// Avoid cutting inside an HTML entity (&...;) or tag (<...>)
+			for back := 0; back < 20 && cut-back > 10; back++ {
+				ch := runes[cut-back-1]
+				if ch == ' ' || ch == '\t' {
+					cut = cut - back
+					break
+				}
+			}
+			result = append(result, string(runes[:cut]))
+			runes = runes[cut:]
+		}
+		if len(runes) > 0 {
+			result = append(result, string(runes))
+		}
+	}
+	return result
+}
+
 // SplitTelegramHTML splits long HTML text into chunks <= maxLen runes while preserving tag integrity
 func SplitTelegramHTML(text string, maxLen int) []string {
 	if utf8.RuneCountInString(text) <= maxLen {
 		return []string{text}
 	}
 
-	lines := strings.Split(text, "\n")
+	rawLines := strings.Split(text, "\n")
+	lines := splitLongLines(rawLines, maxLen-60)
+
 	var chunks []string
 	var current strings.Builder
 	currentLen := 0
 	inPre := false
+	preOpenTag := "<pre>"
+	preCloseTag := "</pre>"
 	inBlockquote := false
+	blockquoteOpenTag := "<blockquote>"
 
 	for _, line := range lines {
 		lineLen := utf8.RuneCountInString(line) + 1 // +1 for newline
 
-		// Check if line contains start/end tags
-		if strings.Contains(line, "<pre>") || strings.Contains(line, "<pre ") {
-			inPre = true
-		}
-		if strings.Contains(line, "</pre>") {
-			inPre = false
-		}
-		if strings.Contains(line, "<blockquote>") {
-			inBlockquote = true
-		}
-		if strings.Contains(line, "</blockquote>") {
-			inBlockquote = false
-		}
-
+		// Check if adding this line exceeds maxLen BEFORE updating tag state for this line
 		if currentLen+lineLen > maxLen && currentLen > 0 {
-			// Need to finish current chunk
 			if inPre {
-				current.WriteString("\n</pre>")
+				current.WriteString("\n" + preCloseTag)
 			}
 			if inBlockquote {
 				current.WriteString("\n</blockquote>")
@@ -180,14 +286,14 @@ func SplitTelegramHTML(text string, maxLen int) []string {
 			current.Reset()
 			currentLen = 0
 
-			// Re-open tags in new chunk
-			if inPre {
-				current.WriteString("<pre>\n")
-				currentLen += 6
-			}
+			// Re-open active block tags in the new chunk
 			if inBlockquote {
-				current.WriteString("<blockquote>\n")
-				currentLen += 13
+				current.WriteString(blockquoteOpenTag + "\n")
+				currentLen += utf8.RuneCountInString(blockquoteOpenTag) + 1
+			}
+			if inPre {
+				current.WriteString(preOpenTag + "\n")
+				currentLen += utf8.RuneCountInString(preOpenTag) + 1
 			}
 		}
 
@@ -196,6 +302,33 @@ func SplitTelegramHTML(text string, maxLen int) []string {
 		}
 		current.WriteString(line)
 		currentLen += lineLen
+
+		// Update tag state AFTER appending the line
+		if m := rePreCodeTag.FindString(line); m != "" {
+			inPre = true
+			preOpenTag = m
+			preCloseTag = "</code></pre>"
+		} else if strings.Contains(line, "<pre>") || strings.Contains(line, "<pre ") {
+			inPre = true
+			preOpenTag = "<pre>"
+			preCloseTag = "</pre>"
+		}
+		if strings.Contains(line, "</pre>") {
+			inPre = false
+			preOpenTag = "<pre>"
+			preCloseTag = "</pre>"
+		}
+		if strings.Contains(line, "<blockquote expandable>") {
+			inBlockquote = true
+			blockquoteOpenTag = "<blockquote expandable>"
+		} else if strings.Contains(line, "<blockquote>") {
+			inBlockquote = true
+			blockquoteOpenTag = "<blockquote>"
+		}
+		if strings.Contains(line, "</blockquote>") {
+			inBlockquote = false
+			blockquoteOpenTag = "<blockquote>"
+		}
 	}
 
 	if current.Len() > 0 {

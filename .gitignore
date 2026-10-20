@@ -51,4 +51,7 @@ log/
 antigravity-bot
 uploads/
 ROADMAP.md
+.sessions.json
+.sessions.json.tmp
+
 
