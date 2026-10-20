@@ -1172,9 +1172,12 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 		_, _ = bot.EditMessageText(chatID, statusMsgID, doneSb.String(), nil, "HTML")
 	}
 
-	// Append dynamic footer showing active model and working directory
-	footer := fmt.Sprintf("\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n🤖 <i>%s</i> | 📂 <code>%s</code>", activeModel, shortenHomeDir(workDir))
-	resultText += footer
+	// Format with new rock-solid Telegram HTML converter
+	htmlContent := FormatTelegramHTML(resultText)
+
+	// Append dynamic HTML footer AFTER markdown-to-HTML conversion so tags are not escaped
+	footer := fmt.Sprintf("\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n🤖 <i>%s</i> | 📂 <code>%s</code>", escapeTelegram(activeModel), escapeTelegram(shortenHomeDir(workDir)))
+	htmlContent += footer
 
 	// Add proactive notification alert header if long task or background
 	prefix := ""
@@ -1182,8 +1185,6 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 		prefix = fmt.Sprintf("🔔 <b>Task Complete!</b> <i>(Duration: %s)</i>\n\n", durStr)
 	}
 
-	// Format with new rock-solid Telegram HTML converter
-	htmlContent := FormatTelegramHTML(resultText)
 	chunks := SplitTelegramHTML(htmlContent, 3800)
 
 	// Send final response as NEW message (triggers Telegram push notification & sound on phone!)
