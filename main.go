@@ -29,18 +29,20 @@ type QueuedMessage struct {
 
 // SessionState stores user configuration, conversation ID and process handles
 type SessionState struct {
-	WorkingDir     string
-	ConversationID string
-	Continue       bool
-	IsBusy         bool
-	TaskStartTime  time.Time
-	ActiveStep     string
-	ActiveThought  string
-	CancelFunc     context.CancelFunc
-	Cmd            *exec.Cmd
-	LastActive     time.Time
-	Queue          []QueuedMessage
-	PendingFiles   []string
+	WorkingDir       string
+	ConversationID   string
+	Continue         bool
+	IsBusy           bool
+	TaskStartTime    time.Time
+	ActiveStep       string
+	ActiveThought    string
+	CancelFunc       context.CancelFunc
+	Cmd              *exec.Cmd
+	LastActive       time.Time
+	Queue            []QueuedMessage
+	PendingFiles     []string
+	TurnsCompleted   int
+	LastTaskDuration string
 }
 
 var (
@@ -118,6 +120,9 @@ func main() {
 
 	log.Printf("Sandbox root dirs: %v", allowedDirs)
 	loadSessions()
+	if pruned := pruneOldUploads(7 * 24 * time.Hour); pruned > 0 {
+		log.Printf("Pruned %d old upload file(s) (>7 days)", pruned)
+	}
 	_, _ = buildDirKeyboard(defaultDir, allowedDirs)
 	_, _ = buildRootsKeyboard(allowedDirs)
 
@@ -138,10 +143,11 @@ func main() {
 	// Set Bot Commands
 	commands := []map[string]string{
 		{"command": "status", "description": "Interactive bot status & control dashboard"},
+		{"command": "quick", "description": "1-tap engineering workflows (test, audit, build)"},
 		{"command": "dir", "description": "Browse & switch working directory (Sandbox)"},
-		{"command": "files", "description": "Browse & download files in current directory"},
+		{"command": "files", "description": "View code in-chat or download directory files"},
 		{"command": "model", "description": "Select and switch active AI model"},
-		{"command": "git", "description": "Interactive Git status, diff, log, pull & AI review"},
+		{"command": "git", "description": "Interactive Git status, diff, log, branches & review"},
 		{"command": "server", "description": "System health, RAM, CPU, disk & battery dashboard"},
 		{"command": "resume", "description": "Browse and resume previous conversations"},
 		{"command": "new", "description": "Start a fresh new conversation"},
@@ -243,13 +249,26 @@ func isAuthorized(userID int64, chatID int64) bool {
 	return allowedUserIDs[userID]
 }
 
+// resolveRealPath evaluates symlinks (or parent directory symlinks if the leaf does not exist yet)
+func resolveRealPath(p string) string {
+	clean := filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(resolved)
+	}
+	parent := filepath.Dir(clean)
+	if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil {
+		return filepath.Join(filepath.Clean(resolvedParent), filepath.Base(clean))
+	}
+	return clean
+}
+
 func isSubDir(parent, child string) bool {
-	parent = filepath.Clean(parent)
-	child = filepath.Clean(child)
-	if parent == child {
+	realParent := resolveRealPath(parent)
+	realChild := resolveRealPath(child)
+	if realParent == realChild {
 		return true
 	}
-	return strings.HasPrefix(child, parent+string(filepath.Separator))
+	return strings.HasPrefix(realChild, realParent+string(filepath.Separator))
 }
 
 func isPathAllowed(targetPath string) bool {
@@ -281,6 +300,8 @@ func buildStatusDashboard(state *SessionState) (string, *InlineKeyboardMarkup) {
 	qCount := len(state.Queue)
 	activeStep := state.ActiveStep
 	taskStart := state.TaskStartTime
+	turns := state.TurnsCompleted
+	lastDur := state.LastTaskDuration
 	mu.RUnlock()
 
 	model := getActiveModel()
@@ -305,6 +326,11 @@ func buildStatusDashboard(state *SessionState) (string, *InlineKeyboardMarkup) {
 		convStr = fmt.Sprintf("<code>%s</code>", escapeTelegram(convID))
 	}
 
+	statsStr := fmt.Sprintf("<code>%d turn(s)</code>", turns)
+	if lastDur != "" {
+		statsStr += fmt.Sprintf(" (last: <i>%s</i>)", escapeTelegram(lastDur))
+	}
+
 	// Check git branch if inside a repo
 	gitInfo := ""
 	if branchOut, err := exec.Command("git", "-C", workDir, "rev-parse", "--abbrev-ref", "HEAD").Output(); err == nil {
@@ -320,12 +346,14 @@ func buildStatusDashboard(state *SessionState) (string, *InlineKeyboardMarkup) {
 • <b>Model:</b> <i>%s</i>
 • <b>Directory:</b> <code>%s</code>%s
 • <b>Session:</b> %s
+• <b>Activity:</b> %s
 • <b>State:</b> %s
 • <b>Bot Uptime:</b> <code>%s</code>`,
 		escapeTelegram(model),
 		escapeTelegram(shortenHomeDir(workDir)),
 		gitInfo,
 		convStr,
+		statsStr,
 		statusStr,
 		uptime,
 	)
@@ -337,14 +365,15 @@ func buildStatusDashboard(state *SessionState) (string, *InlineKeyboardMarkup) {
 				{Text: "📂 Browse Dir", CallbackData: "dir:open"},
 			},
 			{
+				{Text: "⚡ Quick Workflows", CallbackData: "quick:open"},
 				{Text: "🌿 Git Dashboard", CallbackData: "git:status"},
-				{Text: "🖥️ Server Health", CallbackData: "server:refresh"},
 			},
 			{
 				{Text: "💬 Sessions", CallbackData: "resume:page:0"},
-				{Text: "🧹 Compact Context", CallbackData: "action:compact"},
+				{Text: "🖥️ Server Health", CallbackData: "server:refresh"},
 			},
 			{
+				{Text: "🧹 Compact Context", CallbackData: "action:compact"},
 				{Text: "🔄 Refresh Status", CallbackData: "status:open"},
 			},
 		},
@@ -391,6 +420,51 @@ func handleCallbackQuery(bot *TelegramBot, cq *CallbackQuery) {
 		if chatID != 0 && msgID != 0 {
 			bot.EditMessageText(chatID, msgID, text, markup, "HTML")
 		}
+
+	case data == "server:clean_uploads":
+		removed, freed := cleanAllUploads()
+		mu.Lock()
+		state.PendingFiles = nil
+		curDir := state.WorkingDir
+		mu.Unlock()
+		_ = bot.AnswerCallbackQuery(cq.ID, fmt.Sprintf("🧹 Removed %d file(s) (%s)", removed, formatByteSize(freed)))
+		if chatID != 0 && msgID != 0 {
+			text, markup := buildSystemHealthDashboard(curDir)
+			bot.EditMessageText(chatID, msgID, text, markup, "HTML")
+		}
+
+	case data == "quick:open":
+		mu.RLock()
+		curDir := state.WorkingDir
+		mu.RUnlock()
+		text, markup := buildQuickActionsKeyboard(curDir)
+		_ = bot.AnswerCallbackQuery(cq.ID, "⚡ Quick workflows")
+		if chatID != 0 && msgID != 0 {
+			bot.EditMessageText(chatID, msgID, text, markup, "HTML")
+		}
+
+	case strings.HasPrefix(data, "quick:"):
+		act := strings.TrimPrefix(data, "quick:")
+		var prompt string
+		switch act {
+		case "tests":
+			prompt = "Run the full test suite in the current workspace. If any tests fail, diagnose the root cause, fix the code, and re-run the tests until all pass."
+		case "audit":
+			prompt = "Perform a comprehensive security, concurrency, and bug audit of the codebase in the current working directory. Identify any high-impact issues and fix them."
+		case "build":
+			prompt = "Run the build and linter/vet checks in the current workspace. Fix any compilation errors or warnings."
+		case "refactor":
+			prompt = "Inspect the codebase in the current directory for code quality, dead code, or architectural bottlenecks, and apply clean, safe refactoring improvements."
+		case "docs":
+			prompt = "Inspect the codebase and update README.md and documentation files so they accurately reflect the current architecture, features, and commands."
+		case "arch":
+			prompt = "Analyze the current workspace and provide a concise, mobile-friendly overview of its architecture, key files, and how components interact."
+		default:
+			_ = bot.AnswerCallbackQuery(cq.ID, "")
+			return
+		}
+		_ = bot.AnswerCallbackQuery(cq.ID, "⚡ Starting "+act+" workflow...")
+		go executeAgy(bot, userID, chatID, prompt, false)
 
 	case data == "model:open":
 		text, markup := buildModelKeyboard()
@@ -516,6 +590,23 @@ func handleCallbackQuery(bot *TelegramBot, cq *CallbackQuery) {
 			_ = bot.AnswerCallbackQuery(cq.ID, "📄 Files list")
 			if chatID != 0 && msgID != 0 {
 				text, markup := buildFilesKeyboard(targetDir, page)
+				bot.EditMessageText(chatID, msgID, text, markup, "HTML")
+			}
+		}
+
+	case strings.HasPrefix(data, "file:view:"):
+		rest := strings.TrimPrefix(data, "file:view:")
+		parts := strings.SplitN(rest, ":", 2)
+		if len(parts) == 2 {
+			targetPath := filepath.Clean(resolveDirToken(parts[0]))
+			page, _ := strconv.Atoi(parts[1])
+			if !isPathAllowed(targetPath) {
+				_ = bot.AnswerCallbackQuery(cq.ID, "⛔ File outside sandbox.")
+				return
+			}
+			_ = bot.AnswerCallbackQuery(cq.ID, "👁️ "+filepath.Base(targetPath))
+			if chatID != 0 && msgID != 0 {
+				text, markup := buildFilePreviewKeyboard(targetPath, page)
 				bot.EditMessageText(chatID, msgID, text, markup, "HTML")
 			}
 		}
@@ -709,6 +800,8 @@ func handleMessage(bot *TelegramBot, m *Message) {
 		content = "/new"
 	case "🌿 Git":
 		content = "/git"
+	case "⚡ Quick":
+		content = "/quick"
 	case "🖥️ Server":
 		content = "/server"
 	case "🛑 Cancel":
@@ -752,14 +845,16 @@ func handleMessage(bot *TelegramBot, m *Message) {
 
 <b>Navigation &amp; Control:</b>
 • <b>/status</b> — Interactive status &amp; quick-action dashboard
+• <b>/quick</b> — 1-tap workflows (test, audit, build, refactor)
 • <b>/dir [path]</b> — Browse &amp; switch working directory
-• <b>/files</b> — Browse &amp; 1-tap download files in current dir
-• <b>/model</b> — Switch active AI model (` + "<code>Gemini</code> / <code>Claude</code>" + `)
-• <b>/git</b> — Interactive Git status, diff, log, pull &amp; AI review
+• <b>/files</b> — View code in-chat or 1-tap download files
+• <b>/find &lt;query&gt;</b> — Instant workspace filename &amp; text search
+• <b>/model [name]</b> — Switch active AI model (` + "<code>Gemini</code> / <code>Claude</code>" + `)
+• <b>/git</b> — Interactive Git status, diff, log, branches &amp; AI review
 • <b>/server</b> — Real-time RAM, CPU, disk &amp; battery health
 
 <b>Sessions &amp; Tasks:</b>
-• <b>/resume</b> — Browse &amp; switch saved conversations
+• <b>/resume [query]</b> — Browse or search saved conversations
 • <b>/new</b> — Start a fresh conversation session
 • <b>/continue</b> — Continue where the agent left off
 • <b>/compact</b> — Compress conversation context
@@ -802,7 +897,36 @@ func handleMessage(bot *TelegramBot, m *Message) {
 			return
 
 		case "/model":
+			if args != "" {
+				resolvedModel := resolveModelArg(args)
+				if err := setActiveModel(resolvedModel); err != nil {
+					bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to change model: %v", err))
+				} else {
+					bot.SendMessage(m.Chat.ID, fmt.Sprintf("🧠 <b>Active AI Model Changed:</b>\n<code>%s</code>", escapeTelegram(resolvedModel)), "HTML")
+				}
+				return
+			}
 			text, markup := buildModelKeyboard()
+			bot.SendMessageWithMarkup(m.Chat.ID, text, markup, "HTML")
+			return
+
+		case "/find", "/search":
+			if args == "" {
+				bot.SendMessage(m.Chat.ID, "🔎 Please specify a filename or text pattern (e.g. <code>/find handleMessage</code>).", "HTML")
+				return
+			}
+			mu.RLock()
+			curDir := state.WorkingDir
+			mu.RUnlock()
+			text, markup := buildFindResultsKeyboard(curDir, args)
+			bot.SendMessageWithMarkup(m.Chat.ID, text, markup, "HTML")
+			return
+
+		case "/quick", "/workflows":
+			mu.RLock()
+			curDir := state.WorkingDir
+			mu.RUnlock()
+			text, markup := buildQuickActionsKeyboard(curDir)
 			bot.SendMessageWithMarkup(m.Chat.ID, text, markup, "HTML")
 			return
 
@@ -938,19 +1062,28 @@ func handleMessage(bot *TelegramBot, m *Message) {
 			return
 
 		case "/resume":
-			if args != "" {
-				mu.Lock()
-				state.ConversationID = args
-				state.Continue = true
-				state.LastActive = time.Now()
-				mu.Unlock()
-				saveSessions()
-				bot.SendMessage(m.Chat.ID, formatResumeConfirmation(args), "HTML")
-				return
-			}
 			mu.RLock()
 			activeConv := state.ConversationID
 			mu.RUnlock()
+			if args != "" {
+				exactID, searchMsg, searchMarkup := searchConversations(args, activeConv)
+				if exactID != "" {
+					mu.Lock()
+					state.ConversationID = exactID
+					state.Continue = true
+					state.LastActive = time.Now()
+					mu.Unlock()
+					saveSessions()
+					bot.SendMessage(m.Chat.ID, formatResumeConfirmation(exactID), "HTML")
+					return
+				}
+				if searchMarkup != nil {
+					bot.SendMessageWithMarkup(m.Chat.ID, searchMsg, searchMarkup, "HTML")
+				} else {
+					bot.SendMessage(m.Chat.ID, searchMsg, "HTML")
+				}
+				return
+			}
 			text, markup, err := buildResumeKeyboard(activeConv, 0)
 			if err != nil {
 				bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to read conversation history: %v", err))
@@ -1847,6 +1980,12 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 	if elapsed > time.Minute {
 		durStr = fmt.Sprintf("%dm %ds", int(elapsed.Minutes()), int(elapsed.Seconds())%60)
 	}
+
+	mu.Lock()
+	state.TurnsCompleted++
+	state.LastTaskDuration = durStr
+	mu.Unlock()
+	saveSessions()
 
 	// Update live status message to completed (preserving step history and removing Cancel button)
 	if statusMsgID != 0 {

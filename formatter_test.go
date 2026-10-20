@@ -62,6 +62,24 @@ func TestMarkdownTableConversion(t *testing.T) {
 	}
 }
 
+func TestCheckboxesAndHorizontalRulesAndBoldAsterisk(t *testing.T) {
+	input := `**Pointer *p in Go**
+---
+- [x] Completed task
+- [ ] Pending task`
+
+	res := FormatTelegramHTML(input)
+	if !strings.Contains(res, "<b>Pointer *p in Go</b>") {
+		t.Errorf("Bold with inner asterisk failed: %s", res)
+	}
+	if !strings.Contains(res, "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈") {
+		t.Errorf("Horizontal rule not converted: %s", res)
+	}
+	if !strings.Contains(res, "✅ Completed task") || !strings.Contains(res, "⬜ Pending task") {
+		t.Errorf("Task list checkboxes not converted: %s", res)
+	}
+}
+
 func TestExpandableBlockquote(t *testing.T) {
 	var lines []string
 	for i := 0; i < 8; i++ {

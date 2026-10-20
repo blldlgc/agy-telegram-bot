@@ -35,6 +35,9 @@ func registerAskOption(optionText string) string {
 	h := sha1.Sum([]byte(clean))
 	token := fmt.Sprintf("%x", h[:6])
 	askTokenMu.Lock()
+	if len(askTokenMap) > 1000 {
+		askTokenMap = make(map[string]string)
+	}
 	askTokenMap[token] = clean
 	askTokenMu.Unlock()
 	return "ask:opt:" + token
@@ -81,10 +84,12 @@ func extractAskQuestionOptions(args map[string]interface{}) []string {
 
 // PersistedSession represents the on-disk state for a user across restarts
 type PersistedSession struct {
-	WorkingDir     string    `json:"working_dir"`
-	ConversationID string    `json:"conversation_id"`
-	Continue       bool      `json:"continue"`
-	LastActive     time.Time `json:"last_active"`
+	WorkingDir       string    `json:"working_dir"`
+	ConversationID   string    `json:"conversation_id"`
+	Continue         bool      `json:"continue"`
+	LastActive       time.Time `json:"last_active"`
+	TurnsCompleted   int       `json:"turns_completed,omitempty"`
+	LastTaskDuration string    `json:"last_task_duration,omitempty"`
 }
 
 func getSessionsFilePath() string {
@@ -107,10 +112,12 @@ func saveSessions() {
 	dump := make(map[string]PersistedSession, len(sessions))
 	for uid, st := range sessions {
 		dump[strconv.FormatInt(uid, 10)] = PersistedSession{
-			WorkingDir:     st.WorkingDir,
-			ConversationID: st.ConversationID,
-			Continue:       st.Continue,
-			LastActive:     st.LastActive,
+			WorkingDir:       st.WorkingDir,
+			ConversationID:   st.ConversationID,
+			Continue:         st.Continue,
+			LastActive:       st.LastActive,
+			TurnsCompleted:   st.TurnsCompleted,
+			LastTaskDuration: st.LastTaskDuration,
 		}
 	}
 	mu.RUnlock()
@@ -176,11 +183,13 @@ func loadSessions() {
 		}
 
 		sessions[uid] = &SessionState{
-			WorkingDir:     workDir,
-			ConversationID: convID,
-			Continue:       cont,
-			IsBusy:         false,
-			LastActive:     ps.LastActive,
+			WorkingDir:       workDir,
+			ConversationID:   convID,
+			Continue:         cont,
+			IsBusy:           false,
+			LastActive:       ps.LastActive,
+			TurnsCompleted:   ps.TurnsCompleted,
+			LastTaskDuration: ps.LastTaskDuration,
 		}
 	}
 	log.Printf("Restored %d user session(s) from disk", len(sessions))
@@ -191,6 +200,9 @@ func makePathToken(fullPath string) string {
 	h := sha1.Sum([]byte(clean))
 	token := fmt.Sprintf("%x", h[:6])
 	dirTokenMu.Lock()
+	if len(dirTokenMap) > 5000 {
+		dirTokenMap = make(map[string]string)
+	}
 	dirTokenMap[token] = clean
 	dirTokenMu.Unlock()
 	return token
@@ -274,6 +286,25 @@ func buildModelKeyboard() (string, *InlineKeyboardMarkup) {
 	return sb.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
 }
 
+// resolveModelArg matches a user query (like "opus", "sonnet", "argon high", "flash") to an AvailableModels ID or returns the raw string
+func resolveModelArg(arg string) string {
+	q := strings.ToLower(strings.TrimSpace(arg))
+	if q == "" {
+		return ""
+	}
+	for _, m := range AvailableModels {
+		if strings.EqualFold(m.ID, arg) || strings.EqualFold(m.Name, arg) {
+			return m.ID
+		}
+	}
+	for _, m := range AvailableModels {
+		if strings.Contains(strings.ToLower(m.ID), q) {
+			return m.ID
+		}
+	}
+	return strings.TrimSpace(arg)
+}
+
 // setActiveModel updates ~/.gemini/antigravity-cli/settings.json
 func setActiveModel(modelName string) error {
 	homeDir, err := os.UserHomeDir()
@@ -315,6 +346,7 @@ func getDefaultReplyKeyboard() *ReplyKeyboardMarkup {
 			},
 			{
 				{Text: "🌿 Git"},
+				{Text: "⚡ Quick"},
 				{Text: "🖥️ Server"},
 				{Text: "🛑 Cancel"},
 			},
@@ -323,6 +355,37 @@ func getDefaultReplyKeyboard() *ReplyKeyboardMarkup {
 		IsPersistent:          true,
 		InputFieldPlaceholder: "Ask Antigravity or tap a command...",
 	}
+}
+
+// buildQuickActionsKeyboard returns 1-tap engineering workflows for the active directory
+func buildQuickActionsKeyboard(workDir string) (string, *InlineKeyboardMarkup) {
+	displayDir := shortenHomeDir(filepath.Clean(workDir))
+	var sb strings.Builder
+	sb.WriteString("⚡ <b>Quick Engineering Workflows</b>\n")
+	sb.WriteString(fmt.Sprintf("📂 <b>Target Dir:</b> <code>%s</code>\n\n", escapeTelegram(displayDir)))
+	sb.WriteString("Select a 1-tap autonomous workflow to run in this workspace:")
+
+	kb := &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{Text: "🧪 Run Tests & Fix", CallbackData: "quick:tests"},
+				{Text: "🔍 Security & Bug Audit", CallbackData: "quick:audit"},
+			},
+			{
+				{Text: "📦 Build & Verify", CallbackData: "quick:build"},
+				{Text: "🧹 Refactor & Clean", CallbackData: "quick:refactor"},
+			},
+			{
+				{Text: "📝 Update Docs", CallbackData: "quick:docs"},
+				{Text: "🗺️ Explain Architecture", CallbackData: "quick:arch"},
+			},
+			{
+				{Text: "🌿 Git Review Diff", CallbackData: "git:review"},
+				{Text: "📂 Change Dir", CallbackData: "dir:open"},
+			},
+		},
+	}
+	return sb.String(), kb
 }
 
 // buildActionKeyboard returns quick action inline keyboard for completed turns
@@ -690,6 +753,183 @@ func buildResumeKeyboard(activeConvID string, page ...int) (string, *InlineKeybo
 	return sb.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}, nil
 }
 
+// searchConversations searches recent conversations by ID prefix, title, or last message content
+func searchConversations(query string, activeConvID string) (string, string, *InlineKeyboardMarkup) {
+	q := strings.ToLower(strings.TrimSpace(query))
+	convs, _ := getRecentConversations(50)
+
+	var matches []ConversationSummary
+	for _, c := range convs {
+		if strings.EqualFold(c.ID, q) {
+			return c.ID, "", nil
+		}
+		lastUser, lastBot := getConversationPreview(c.ID)
+		if strings.HasPrefix(strings.ToLower(c.ID), q) ||
+			strings.Contains(strings.ToLower(c.Title), q) ||
+			strings.Contains(strings.ToLower(lastUser), q) ||
+			strings.Contains(strings.ToLower(lastBot), q) {
+			matches = append(matches, c)
+		}
+	}
+
+	if len(matches) == 1 {
+		return matches[0].ID, "", nil
+	}
+
+	if len(matches) == 0 {
+		// Allow raw UUIDs (e.g. 36 chars with hyphens) even if not in top 50
+		if len(q) >= 32 && strings.Count(q, "-") >= 4 {
+			return strings.TrimSpace(query), "", nil
+		}
+		msg := fmt.Sprintf("🔍 No saved conversations matched <code>%s</code>.\nUse <b>/resume</b> to browse all sessions.", escapeTelegram(query))
+		return "", msg, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🔍 <b>Search Results for</b> <code>%s</code> (%d found):\n\n", escapeTelegram(query), len(matches)))
+
+	var rows [][]InlineKeyboardButton
+	for i, c := range matches {
+		if i >= 8 {
+			break
+		}
+		num := i + 1
+		isActive := activeConvID != "" && c.ID == activeConvID
+		badge := ""
+		if isActive {
+			badge = " 🟢"
+		}
+		shortID := c.ID
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+		sb.WriteString(fmt.Sprintf("<b>%d.</b> %s%s (<code>%s</code>)\n", num, escapeTelegram(c.Title), badge, shortID))
+		btnTitle := fmt.Sprintf("%d. %s", num, truncateStr(c.Title, 24))
+		rows = append(rows, []InlineKeyboardButton{
+			{Text: btnTitle, CallbackData: "resume:" + c.ID},
+		})
+	}
+	rows = append(rows, []InlineKeyboardButton{
+		{Text: "📋 All Sessions", CallbackData: "resume:page:0"},
+	})
+
+	return "", sb.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// buildFindResultsKeyboard searches filenames and file contents in baseDir for query
+func buildFindResultsKeyboard(baseDir string, query string) (string, *InlineKeyboardMarkup) {
+	cleanBase := filepath.Clean(baseDir)
+	displayDir := shortenHomeDir(cleanBase)
+	qLower := strings.ToLower(strings.TrimSpace(query))
+
+	type matchItem struct {
+		relPath  string
+		fullPath string
+		size     int64
+		matchInfo string
+	}
+	var results []matchItem
+
+	_ = filepath.WalkDir(cleanBase, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if path != cleanBase && (strings.HasPrefix(name, ".") || name == "node_modules" || name == "vendor" || name == "dist" || name == "build") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(name, ".") {
+			return nil
+		}
+		if len(results) >= 10 {
+			return filepath.SkipAll
+		}
+
+		rel, err := filepath.Rel(cleanBase, path)
+		if err != nil {
+			rel = name
+		}
+		info, err := d.Info()
+		var sz int64
+		if err == nil {
+			sz = info.Size()
+		}
+
+		// 1. Check filename match
+		if strings.Contains(strings.ToLower(rel), qLower) {
+			results = append(results, matchItem{
+				relPath:   rel,
+				fullPath:  path,
+				size:      sz,
+				matchInfo: "Filename match",
+			})
+			return nil
+		}
+
+		// 2. Check content match for text files <= 512 KB
+		if sz > 0 && sz <= 512*1024 {
+			data, err := os.ReadFile(path)
+			if err == nil {
+				checkLen := len(data)
+				if checkLen > 512 {
+					checkLen = 512
+				}
+				for i := 0; i < checkLen; i++ {
+					if data[i] == 0 {
+						return nil // skip binary
+					}
+				}
+				lines := strings.Split(string(data), "\n")
+				for lineIdx, line := range lines {
+					if strings.Contains(strings.ToLower(line), qLower) {
+						results = append(results, matchItem{
+							relPath:   rel,
+							fullPath:  path,
+							size:      sz,
+							matchInfo: fmt.Sprintf("L%d: %s", lineIdx+1, truncateStr(strings.TrimSpace(line), 55)),
+						})
+						break
+					}
+				}
+			}
+		}
+		return nil
+	})
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🔎 <b>Workspace Search:</b> <code>%s</code>\n", escapeTelegram(query)))
+	sb.WriteString(fmt.Sprintf("📂 <b>Dir:</b> <code>%s</code>\n\n", escapeTelegram(displayDir)))
+
+	var rows [][]InlineKeyboardButton
+	if len(results) == 0 {
+		sb.WriteString("<i>No matching files or text found in workspace.</i>")
+	} else {
+		for i, r := range results {
+			if i >= 8 {
+				break
+			}
+			sb.WriteString(fmt.Sprintf("<b>%d.</b> <code>%s</code> (%s)\n   └ <i>%s</i>\n",
+				i+1, escapeTelegram(r.relPath), formatByteSize(r.size), escapeTelegram(r.matchInfo)))
+			fToken := makePathToken(r.fullPath)
+			rows = append(rows, []InlineKeyboardButton{
+				{Text: fmt.Sprintf("👁️ %d. %s", i+1, truncateStr(filepath.Base(r.relPath), 18)), CallbackData: fmt.Sprintf("file:view:%s:0", fToken)},
+				{Text: "📥 Download", CallbackData: "file:dl:" + fToken},
+			})
+		}
+	}
+
+	curToken := makePathToken(cleanBase)
+	rows = append(rows, []InlineKeyboardButton{
+		{Text: "📄 All Files", CallbackData: fmt.Sprintf("file:list:%s:0", curToken)},
+		{Text: "📂 Dir Explorer", CallbackData: "dir:open"},
+	})
+
+	return sb.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
 // buildDirKeyboard constructs interactive directory selection with pagination and file browser access
 func buildDirKeyboard(currentDir string, allowed []string, page ...int) (string, *InlineKeyboardMarkup) {
 	curPage := 0
@@ -854,14 +1094,15 @@ func buildFilesKeyboard(currentDir string, page int) (string, *InlineKeyboardMar
 	}
 
 	var sb strings.Builder
-	sb.WriteString("📄 <b>Directory Files (Tap to Download):</b>\n\n")
+	sb.WriteString("📄 <b>Directory Files (View or Download):</b>\n\n")
 	sb.WriteString(fmt.Sprintf("📍 <b>Dir:</b> <code>%s</code>\n", escapeTelegram(displayDir)))
 
 	var rows [][]InlineKeyboardButton
 	if len(files) == 0 {
 		sb.WriteString("\n<i>No visible files in this directory.</i>")
 	} else {
-		sb.WriteString(fmt.Sprintf("📦 <i>Showing page %d/%d (%d total files)</i>\n\n", page+1, totalPages, len(files)))
+		sb.WriteString(fmt.Sprintf("📦 <i>Showing page %d/%d (%d total files)</i>\n", page+1, totalPages, len(files)))
+		sb.WriteString("<i>Tap 👁️ to view code/text in chat, or 📥 to download:</i>\n\n")
 		startIdx := page * perPage
 		endIdx := startIdx + perPage
 		if endIdx > len(files) {
@@ -872,13 +1113,14 @@ func buildFilesKeyboard(currentDir string, page int) (string, *InlineKeyboardMar
 			fullPath := filepath.Join(cleanCurrent, f.name)
 			fToken := makePathToken(fullPath)
 			sizeStr := formatByteSize(f.size)
-			btnText := fmt.Sprintf("📥 %s (%s)", f.name, sizeStr)
-			if len([]rune(btnText)) > 34 {
-				btnText = fmt.Sprintf("📥 %s (%s)", truncateStr(f.name, 20), sizeStr)
-			}
+			viewText := fmt.Sprintf("👁️ %s (%s)", truncateStr(f.name, 18), sizeStr)
 			rows = append(rows, []InlineKeyboardButton{
 				{
-					Text:         btnText,
+					Text:         viewText,
+					CallbackData: fmt.Sprintf("file:view:%s:0", fToken),
+				},
+				{
+					Text:         "📥 Download",
 					CallbackData: "file:dl:" + fToken,
 				},
 			})
@@ -907,6 +1149,150 @@ func buildFilesKeyboard(currentDir string, page int) (string, *InlineKeyboardMar
 	rows = append(rows, []InlineKeyboardButton{
 		{Text: "📂 Back to Folders", CallbackData: registerDirToken(cleanCurrent)},
 		{Text: "🔄 Refresh", CallbackData: fmt.Sprintf("file:list:%s:%d", curToken, page)},
+	})
+
+	return sb.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+func detectCodeLang(fileName string) string {
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(fileName), "."))
+	switch ext {
+	case "go", "py", "js", "ts", "tsx", "jsx", "json", "yaml", "yml", "sh", "bash", "md", "sql", "html", "css", "rs", "c", "cpp", "java", "kt", "rb", "php", "toml", "ini", "xml", "dockerfile":
+		return ext
+	default:
+		return ""
+	}
+}
+
+// buildFilePreviewKeyboard renders a paginated, syntax-highlighted in-chat preview of a text/code file
+func buildFilePreviewKeyboard(filePath string, page int) (string, *InlineKeyboardMarkup) {
+	cleanPath := filepath.Clean(filePath)
+	fileName := filepath.Base(cleanPath)
+	parentDir := filepath.Dir(cleanPath)
+	fToken := makePathToken(cleanPath)
+	parentToken := makePathToken(parentDir)
+
+	info, err := os.Stat(cleanPath)
+	if err != nil || info.IsDir() {
+		return "❌ <b>File not found or is a directory.</b>", &InlineKeyboardMarkup{
+			InlineKeyboard: [][]InlineKeyboardButton{
+				{{Text: "📂 Back to Files", CallbackData: fmt.Sprintf("file:list:%s:0", parentToken)}},
+			},
+		}
+	}
+
+	// Read up to 256 KB for in-chat preview
+	const maxPreviewBytes = 256 * 1024
+	f, err := os.Open(cleanPath)
+	if err != nil {
+		return fmt.Sprintf("❌ <b>Cannot open file:</b> %v", escapeTelegram(err.Error())), nil
+	}
+	defer f.Close()
+
+	readSize := info.Size()
+	if readSize > maxPreviewBytes {
+		readSize = maxPreviewBytes
+	}
+	buf := make([]byte, readSize)
+	n, _ := f.Read(buf)
+	buf = buf[:n]
+
+	// Check if binary (contains null byte in first 512 bytes)
+	checkLen := len(buf)
+	if checkLen > 512 {
+		checkLen = 512
+	}
+	isBinary := false
+	for i := 0; i < checkLen; i++ {
+		if buf[i] == 0 {
+			isBinary = true
+			break
+		}
+	}
+
+	if isBinary {
+		text := fmt.Sprintf("📦 <b>Binary File:</b> <code>%s</code> (%s)\n\n<i>Binary files cannot be previewed as text. Tap Download below to get the file:</i>",
+			escapeTelegram(fileName), formatByteSize(info.Size()))
+		kb := &InlineKeyboardMarkup{
+			InlineKeyboard: [][]InlineKeyboardButton{
+				{
+					{Text: "📥 Download File", CallbackData: "file:dl:" + fToken},
+					{Text: "📂 Back to Files", CallbackData: fmt.Sprintf("file:list:%s:0", parentToken)},
+				},
+			},
+		}
+		return text, kb
+	}
+
+	rawLines := strings.Split(strings.ReplaceAll(string(buf), "\r\n", "\n"), "\n")
+	const linesPerPage = 45
+	totalPages := (len(rawLines) + linesPerPage - 1) / linesPerPage
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= totalPages {
+		page = totalPages - 1
+	}
+
+	startLine := page * linesPerPage
+	endLine := startLine + linesPerPage
+	if endLine > len(rawLines) {
+		endLine = len(rawLines)
+	}
+
+	var codeSb strings.Builder
+	for i := startLine; i < endLine; i++ {
+		lineText := rawLines[i]
+		if len([]rune(lineText)) > 120 {
+			lineText = string([]rune(lineText)[:117]) + "..."
+		}
+		codeSb.WriteString(fmt.Sprintf("%4d │ %s\n", i+1, lineText))
+	}
+
+	lang := detectCodeLang(fileName)
+	var preBlock string
+	if lang != "" {
+		preBlock = fmt.Sprintf("<pre><code class=\"language-%s\">%s</code></pre>", escapeTelegram(lang), escapeTelegram(strings.TrimSuffix(codeSb.String(), "\n")))
+	} else {
+		preBlock = fmt.Sprintf("<pre>%s</pre>", escapeTelegram(strings.TrimSuffix(codeSb.String(), "\n")))
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📄 <b>%s</b> (<i>%s, lines %d–%d of %d</i>)\n",
+		escapeTelegram(fileName), formatByteSize(info.Size()), startLine+1, endLine, len(rawLines)))
+	sb.WriteString(preBlock)
+
+	var rows [][]InlineKeyboardButton
+	if totalPages > 1 {
+		var navRow []InlineKeyboardButton
+		if page > 0 {
+			navRow = append(navRow, InlineKeyboardButton{
+				Text:         "⬅️ Prev Lines",
+				CallbackData: fmt.Sprintf("file:view:%s:%d", fToken, page-1),
+			})
+		}
+		navRow = append(navRow, InlineKeyboardButton{
+			Text:         fmt.Sprintf("📖 %d/%d", page+1, totalPages),
+			CallbackData: fmt.Sprintf("file:view:%s:%d", fToken, page),
+		})
+		if page+1 < totalPages {
+			navRow = append(navRow, InlineKeyboardButton{
+				Text:         "Next Lines ➡️",
+				CallbackData: fmt.Sprintf("file:view:%s:%d", fToken, page+1),
+			})
+		}
+		rows = append(rows, navRow)
+	}
+
+	rows = append(rows, []InlineKeyboardButton{
+		{Text: "📥 Download", CallbackData: "file:dl:" + fToken},
+		{Text: "🔍 AI Analyze", CallbackData: "file:act:analyze:" + fToken},
+	})
+	rows = append(rows, []InlineKeyboardButton{
+		{Text: "📂 Back to Files", CallbackData: fmt.Sprintf("file:list:%s:0", parentToken)},
 	})
 
 	return sb.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
@@ -948,26 +1334,39 @@ func buildGitDashboard(dir string, action string) (string, *InlineKeyboardMarkup
 	cleanDir := filepath.Clean(dir)
 	displayDir := shortenHomeDir(cleanDir)
 
-	kb := &InlineKeyboardMarkup{
-		InlineKeyboard: [][]InlineKeyboardButton{
-			{
-				{Text: "🔄 Status", CallbackData: "git:status"},
-				{Text: "📊 Diff Stat", CallbackData: "git:diff"},
-			},
-			{
-				{Text: "📜 Recent Commits", CallbackData: "git:log"},
-				{Text: "📥 Git Pull", CallbackData: "git:pull"},
-			},
-			{
-				{Text: "🔍 AI Code Review", CallbackData: "git:review"},
-				{Text: "📂 Dir Menu", CallbackData: "dir:open"},
-			},
+	defaultRows := [][]InlineKeyboardButton{
+		{
+			{Text: "🔄 Status", CallbackData: "git:status"},
+			{Text: "📊 Diff Stat", CallbackData: "git:diff"},
+			{Text: "📝 Full Diff", CallbackData: "git:fulldiff"},
+		},
+		{
+			{Text: "📜 Commits", CallbackData: "git:log"},
+			{Text: "🌿 Branches", CallbackData: "git:branches"},
+			{Text: "📥 Pull", CallbackData: "git:pull"},
+		},
+		{
+			{Text: "🔍 AI Code Review", CallbackData: "git:review"},
+			{Text: "📂 Dir Menu", CallbackData: "dir:open"},
 		},
 	}
 
 	checkCmd := exec.Command("git", "-C", cleanDir, "rev-parse", "--is-inside-work-tree")
 	if out, err := checkCmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "true") {
-		return fmt.Sprintf("🌿 <b>Git Dashboard</b>\n📂 <code>%s</code>\n\nℹ️ <i>This directory is not a Git repository.</i>", escapeTelegram(displayDir)), kb
+		return fmt.Sprintf("🌿 <b>Git Dashboard</b>\n📂 <code>%s</code>\n\nℹ️ <i>This directory is not a Git repository.</i>", escapeTelegram(displayDir)), &InlineKeyboardMarkup{InlineKeyboard: defaultRows}
+	}
+
+	// If switching branch via git:checkout:<branch>
+	checkoutMsg := ""
+	if strings.HasPrefix(action, "checkout:") {
+		targetBranch := strings.TrimSpace(strings.TrimPrefix(action, "checkout:"))
+		coOut, err := exec.Command("git", "-C", cleanDir, "checkout", targetBranch).CombinedOutput()
+		if err != nil {
+			checkoutMsg = fmt.Sprintf("❌ <b>Checkout Failed:</b>\n<pre>%s</pre>\n\n", escapeTelegram(strings.TrimSpace(string(coOut))))
+		} else {
+			checkoutMsg = fmt.Sprintf("✅ <b>Switched to branch:</b> <code>%s</code>\n\n", escapeTelegram(targetBranch))
+		}
+		action = "branches"
 	}
 
 	branchOut, _ := exec.Command("git", "-C", cleanDir, "rev-parse", "--abbrev-ref", "HEAD").Output()
@@ -1007,9 +1406,14 @@ func buildGitDashboard(dir string, action string) (string, *InlineKeyboardMarkup
 	sb.WriteString(fmt.Sprintf("📂 <b>Dir:</b> <code>%s</code>\n", escapeTelegram(displayDir)))
 	sb.WriteString(fmt.Sprintf("🔀 <b>Branch:</b> <code>%s</code><i>%s</i>\n", escapeTelegram(branch), escapeTelegram(syncBadge)))
 	sb.WriteString(fmt.Sprintf("📝 <b>Latest:</b> <code>%s</code>\n\n", escapeTelegram(lastCommit)))
+	if checkoutMsg != "" {
+		sb.WriteString(checkoutMsg)
+	}
 
-	switch action {
-	case "diff":
+	customRows := defaultRows
+
+	switch {
+	case action == "diff":
 		unstagedOut, _ := exec.Command("git", "-C", cleanDir, "diff", "--stat").CombinedOutput()
 		stagedOut, _ := exec.Command("git", "-C", cleanDir, "diff", "--cached", "--stat").CombinedOutput()
 		unstagedStr := strings.TrimSpace(string(unstagedOut))
@@ -1034,16 +1438,80 @@ func buildGitDashboard(dir string, action string) (string, *InlineKeyboardMarkup
 			}
 		}
 
-	case "log":
-		logOut, _ := exec.Command("git", "-C", cleanDir, "log", "-n", "8", "--pretty=format:• %h — %s (%cr)").CombinedOutput()
-		logStr := strings.TrimSpace(string(logOut))
-		if logStr == "" {
-			logStr = "No commit history found."
+	case action == "fulldiff":
+		diffOut, _ := exec.Command("git", "-C", cleanDir, "diff", "HEAD").CombinedOutput()
+		diffStr := strings.TrimSpace(string(diffOut))
+		if diffStr == "" {
+			sb.WriteString("📝 <b>Full Unified Diff:</b>\n<i>Working tree matches HEAD (no changes).</i>")
+		} else {
+			if len([]rune(diffStr)) > 2600 {
+				diffStr = string([]rune(diffStr)[:2600]) + "\n... (truncated)"
+			}
+			sb.WriteString("📝 <b>Full Unified Diff (HEAD):</b>\n")
+			sb.WriteString(fmt.Sprintf("<pre><code class=\"language-diff\">%s</code></pre>", escapeTelegram(diffStr)))
 		}
-		sb.WriteString("📜 <b>Recent Commits:</b>\n")
-		sb.WriteString(fmt.Sprintf("<pre>%s</pre>", escapeTelegram(logStr)))
 
-	case "pull":
+	case action == "log":
+		logOut, _ := exec.Command("git", "-C", cleanDir, "log", "-n", "6", "--pretty=format:%h|||%s|||%cr").CombinedOutput()
+		rawLines := strings.Split(strings.TrimSpace(string(logOut)), "\n")
+		if len(rawLines) == 0 || rawLines[0] == "" {
+			sb.WriteString("📜 <b>Recent Commits:</b>\n<i>No commit history found.</i>")
+		} else {
+			sb.WriteString("📜 <b>Recent Commits (Tap a commit to inspect):</b>\n\n")
+			var commitBtns [][]InlineKeyboardButton
+			for _, l := range rawLines {
+				parts := strings.Split(l, "|||")
+				if len(parts) >= 3 {
+					hash := strings.TrimSpace(parts[0])
+					subj := strings.TrimSpace(parts[1])
+					relTime := strings.TrimSpace(parts[2])
+					sb.WriteString(fmt.Sprintf("• <code>%s</code> — %s <i>(%s)</i>\n", escapeTelegram(hash), escapeTelegram(subj), escapeTelegram(relTime)))
+					btnLabel := fmt.Sprintf("🔍 %s: %s", hash, truncateStr(subj, 24))
+					commitBtns = append(commitBtns, []InlineKeyboardButton{
+						{Text: btnLabel, CallbackData: "git:show:" + hash},
+					})
+				}
+			}
+			customRows = append(commitBtns, defaultRows...)
+		}
+
+	case strings.HasPrefix(action, "show:"):
+		commitHash := strings.TrimSpace(strings.TrimPrefix(action, "show:"))
+		showOut, err := exec.Command("git", "-C", cleanDir, "show", "--stat", "--pretty=format:Commit: %h%nAuthor: %an <%ae>%nDate:   %ad (%cr)%n%n    %s%n", commitHash).CombinedOutput()
+		showStr := strings.TrimSpace(string(showOut))
+		if err != nil || showStr == "" {
+			sb.WriteString(fmt.Sprintf("❌ <b>Could not inspect commit:</b> <code>%s</code>", escapeTelegram(commitHash)))
+		} else {
+			if len([]rune(showStr)) > 2600 {
+				showStr = string([]rune(showStr)[:2600]) + "\n..."
+			}
+			sb.WriteString(fmt.Sprintf("🔍 <b>Commit Details (<code>%s</code>):</b>\n<pre>%s</pre>", escapeTelegram(commitHash), escapeTelegram(showStr)))
+		}
+
+	case action == "branches":
+		brOut, _ := exec.Command("git", "-C", cleanDir, "branch", "--format=%(refname:short)").Output()
+		brLines := strings.Split(strings.TrimSpace(string(brOut)), "\n")
+		sb.WriteString("🌿 <b>Local Branches (Tap to switch):</b>\n\n")
+		var brRows [][]InlineKeyboardButton
+		for i, bName := range brLines {
+			bName = strings.TrimSpace(bName)
+			if bName == "" || i >= 8 {
+				continue
+			}
+			prefix := "⚪ "
+			if bName == branch {
+				prefix = "🟢 "
+			}
+			sb.WriteString(fmt.Sprintf("%s<code>%s</code>\n", prefix, escapeTelegram(bName)))
+			if len(bName) <= 45 {
+				brRows = append(brRows, []InlineKeyboardButton{
+					{Text: prefix + bName, CallbackData: "git:checkout:" + bName},
+				})
+			}
+		}
+		customRows = append(brRows, defaultRows...)
+
+	case action == "pull":
 		pullOut, err := exec.Command("git", "-C", cleanDir, "pull", "--ff-only").CombinedOutput()
 		pullStr := strings.TrimSpace(string(pullOut))
 		if err != nil {
@@ -1063,7 +1531,7 @@ func buildGitDashboard(dir string, action string) (string, *InlineKeyboardMarkup
 		}
 	}
 
-	return sb.String(), kb
+	return sb.String(), &InlineKeyboardMarkup{InlineKeyboard: customRows}
 }
 
 func renderProgressBar(percent float64, width int) string {
@@ -1147,11 +1615,19 @@ func buildSystemHealthDashboard(workDir string) (string, *InlineKeyboardMarkup) 
 		sb.WriteString(fmt.Sprintf("🔋 <b>Battery:</b> %s\n", batStr))
 	}
 
+	// 7. Uploads Cache Directory Stats
+	upCount, upBytes := getUploadsStats()
+	sb.WriteString(fmt.Sprintf("📥 <b>Uploads Cache:</b> <code>%d file(s)</code> (%s)\n", upCount, formatByteSize(upBytes)))
+
 	kb := &InlineKeyboardMarkup{
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{
 				{Text: "🔄 Refresh Health", CallbackData: "server:refresh"},
+				{Text: "🧹 Clean Uploads", CallbackData: "server:clean_uploads"},
+			},
+			{
 				{Text: "📊 Bot Status", CallbackData: "status:open"},
+				{Text: "⚡ Quick Actions", CallbackData: "quick:open"},
 			},
 			{
 				{Text: "📂 Working Dir", CallbackData: "dir:open"},
@@ -1161,6 +1637,72 @@ func buildSystemHealthDashboard(workDir string) (string, *InlineKeyboardMarkup) 
 	}
 
 	return sb.String(), kb
+}
+
+// getUploadsStats returns the number of files and total size in bytes in the uploads directory
+func getUploadsStats() (int, int64) {
+	upDir := getUploadsDir()
+	entries, err := os.ReadDir(upDir)
+	if err != nil {
+		return 0, 0
+	}
+	count := 0
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			count++
+			total += info.Size()
+		}
+	}
+	return count, total
+}
+
+// pruneOldUploads deletes uploaded files older than maxAge
+func pruneOldUploads(maxAge time.Duration) int {
+	upDir := getUploadsDir()
+	entries, err := os.ReadDir(upDir)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > maxAge {
+			if os.Remove(filepath.Join(upDir, e.Name())) == nil {
+				removed++
+			}
+		}
+	}
+	return removed
+}
+
+// cleanAllUploads removes all cached files in the uploads directory
+func cleanAllUploads() (int, int64) {
+	upDir := getUploadsDir()
+	entries, err := os.ReadDir(upDir)
+	if err != nil {
+		return 0, 0
+	}
+	removed := 0
+	var freed int64
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		full := filepath.Join(upDir, e.Name())
+		if info, err := e.Info(); err == nil {
+			if os.Remove(full) == nil {
+				removed++
+				freed += info.Size()
+			}
+		}
+	}
+	return removed, freed
 }
 
 func readBatteryStatus() string {

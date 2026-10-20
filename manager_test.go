@@ -100,14 +100,62 @@ func TestBuildDashboards(t *testing.T) {
 	}
 
 	st := &SessionState{
-		WorkingDir:     cwd,
-		ConversationID: "test-conv-12345678",
-		IsBusy:         true,
-		TaskStartTime:  time.Now().Add(-15 * time.Second),
-		ActiveStep:     "📖 Reading <code>main.go</code>",
+		WorkingDir:       cwd,
+		ConversationID:   "test-conv-12345678",
+		IsBusy:           true,
+		TaskStartTime:    time.Now().Add(-15 * time.Second),
+		ActiveStep:       "📖 Reading <code>main.go</code>",
+		TurnsCompleted:   4,
+		LastTaskDuration: "8.2s",
 	}
 	statusText, statusKb := buildStatusDashboard(st)
-	if !strings.Contains(statusText, "Antigravity Status Dashboard") || statusKb == nil {
+	if !strings.Contains(statusText, "Antigravity Status Dashboard") || !strings.Contains(statusText, "4 turn(s)") || statusKb == nil {
 		t.Errorf("buildStatusDashboard failed: %s", statusText)
+	}
+
+	previewText, previewKb := buildFilePreviewKeyboard(filepath.Join(cwd, "main.go"), 0)
+	if !strings.Contains(previewText, "package main") || previewKb == nil {
+		t.Errorf("buildFilePreviewKeyboard failed: %s", previewText)
+	}
+
+	quickText, quickKb := buildQuickActionsKeyboard(cwd)
+	if !strings.Contains(quickText, "Quick Engineering Workflows") || quickKb == nil {
+		t.Errorf("buildQuickActionsKeyboard failed: %s", quickText)
+	}
+
+	for _, gitAct := range []string{"status", "diff", "fulldiff", "log", "branches"} {
+		gt, gk := buildGitDashboard(cwd, gitAct)
+		if gt == "" || gk == nil {
+			t.Errorf("buildGitDashboard(%s) failed", gitAct)
+		}
+	}
+
+	findText, findKb := buildFindResultsKeyboard(cwd, "FormatTelegramHTML")
+	if !strings.Contains(findText, "formatter.go") || findKb == nil {
+		t.Errorf("buildFindResultsKeyboard failed: %s", findText)
+	}
+
+	if got := resolveModelArg("opus"); !strings.Contains(got, "Opus") {
+		t.Errorf("resolveModelArg('opus') = %q, expected Opus model", got)
+	}
+}
+
+func TestSymlinkSandboxProtection(t *testing.T) {
+	tmpRoot := t.TempDir()
+	allowedSub := filepath.Join(tmpRoot, "allowed")
+	outsideSub := filepath.Join(tmpRoot, "outside")
+	_ = os.MkdirAll(allowedSub, 0755)
+	_ = os.MkdirAll(outsideSub, 0755)
+
+	secretFile := filepath.Join(outsideSub, "secret.txt")
+	_ = os.WriteFile(secretFile, []byte("top-secret"), 0644)
+
+	symlinkPath := filepath.Join(allowedSub, "escape_link.txt")
+	if err := os.Symlink(secretFile, symlinkPath); err != nil {
+		t.Skipf("Symlink not supported: %v", err)
+	}
+
+	if isSubDir(allowedSub, symlinkPath) {
+		t.Errorf("SECURITY BUG: Symlink pointing outside sandbox was allowed by isSubDir!")
 	}
 }

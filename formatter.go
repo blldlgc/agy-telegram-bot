@@ -8,17 +8,20 @@ import (
 )
 
 var (
-	reBold1      = regexp.MustCompile(`\*\*([^*]+)\*\*`)
-	reBold2      = regexp.MustCompile(`__([^_]+)__`)
-	reItalic1    = regexp.MustCompile(`(?m)(^|[^\*])\*([^\*\s][^\*]*[^\*\s]|[^\*\s])\*([^\*]|$)`)
-	reItalic2    = regexp.MustCompile(`(?m)(^|[^_])_([^_ \s][^_]*[^_ \s]|[^_ \s])_([^_]|$)`)
-	reStrike     = regexp.MustCompile(`~~([^~]+)~~`)
-	reLink       = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^\s\)]+)\)`)
-	reHeader     = regexp.MustCompile(`(?m)^#{1,6}\s*(.+)$`)
-	reBullet     = regexp.MustCompile(`(?m)^[\*\-]\s+(.+)$`)
-	reHTMLTag    = regexp.MustCompile(`<[^>]+>`)
-	rePreCodeTag = regexp.MustCompile(`<pre><code[^>]*>`)
-	reTableSep   = regexp.MustCompile(`^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?\s*$`)
+	reBold1        = regexp.MustCompile(`\*\*([^\n]+?)\*\*`)
+	reBold2        = regexp.MustCompile(`__([^\n]+?)__`)
+	reItalic1      = regexp.MustCompile(`(?m)(^|[^\*])\*([^\*\s][^\*\n]*[^\*\s]|[^\*\s])\*([^\*]|$)`)
+	reItalic2      = regexp.MustCompile(`(?m)(^|[^_])_([^_ \s][^_\n]*[^_ \s]|[^_ \s])_([^_]|$)`)
+	reStrike       = regexp.MustCompile(`~~([^\n]+?)~~`)
+	reLink         = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^\s\)]+)\)`)
+	reHeader       = regexp.MustCompile(`(?m)^#{1,6}\s*(.+)$`)
+	reTaskDone     = regexp.MustCompile(`(?im)^\s*[\*\-]\s+\[x\]\s+(.+)$`)
+	reTaskTodo     = regexp.MustCompile(`(?m)^\s*[\*\-]\s+\[\s\]\s+(.+)$`)
+	reBullet       = regexp.MustCompile(`(?m)^[\*\-]\s+(.+)$`)
+	reHorizRule    = regexp.MustCompile(`(?m)^\s*(?:-\s*-\s*-+|\*\s*\*\s*\*+|_\s*_\s*_+)\s*$`)
+	reHTMLTag      = regexp.MustCompile(`<[^>]+>`)
+	rePreCodeTag   = regexp.MustCompile(`<pre><code[^>]*>`)
+	reTableSep     = regexp.MustCompile(`^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?\s*$`)
 )
 
 func escapeTelegram(s string) string {
@@ -159,8 +162,15 @@ func FormatTelegramHTML(text string) string {
 	text = escapeTelegram(text)
 
 	// 4. Transform Markdown Elements
+	// Horizontal rules (---, ***, ___) -> sleek mobile divider (before bold/italic!)
+	text = reHorizRule.ReplaceAllString(text, "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈")
+
 	// Headers -> Bold
 	text = reHeader.ReplaceAllString(text, "<b>$1</b>")
+
+	// Task list checkboxes (- [x] / - [ ]) -> ✅ / ⬜
+	text = reTaskDone.ReplaceAllString(text, "✅ $1")
+	text = reTaskTodo.ReplaceAllString(text, "⬜ $1")
 
 	// Bullet points
 	text = reBullet.ReplaceAllString(text, "• $1")

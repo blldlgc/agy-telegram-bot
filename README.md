@@ -32,9 +32,10 @@ By bridging Antigravity CLI with **Telegram**, this project unlocks the ability 
 - **Real-Time Step History, Live Cancel & Push Alerts ⚡**: Streams a live checklist of completed (`✅`) and active (`⚡`) tool steps with elapsed timer (`⏱️`) and an inline `[🛑 Cancel Task]` button right on the progress card, delivering the final response as a new message to guarantee mobile push notifications.
 - **Persistent Session State (`.sessions.json`) 💾**: Automatically saves and restores each user's active working directory and conversation ID across bot restarts or server reboots.
 - **Smart Message Queueing 📥**: Send follow-up prompts even while the bot is busy—messages are automatically queued and executed in order, with inline buttons to `[⚡ Interrupt & Run Now]` or `[🗑️ Clear Queue]`, and a `/tasks` monitor.
-- **Instant Git Dashboard & 1-Tap AI Code Review 🌿**: Check repository status, staged & unstaged diff stats, ahead/behind counts, recent commits, `git pull`, or trigger an AI code review via `/git` or `/review`.
-- **Interactive System & Server Health Dashboard 🖥️**: Monitor real-time RAM, CPU load, disk usage progress bars, battery level/temperature, and bot uptime via `/server`.
-- **Paginated Directory & File Browser 📂📄**: Navigate any number of folders with pagination (`/dir`) and browse/download files in the current directory with a single tap (`/files`).
+- **Instant Git Dashboard, Branch Switcher & 1-Tap AI Code Review 🌿**: Check repository status, staged & unstaged diff stats, full unified diff (`git diff HEAD`), ahead/behind counts, inspect individual commits, switch local branches, `git pull`, or trigger an AI code review via `/git` or `/review`.
+- **Interactive System & Server Health Dashboard 🖥️**: Monitor real-time RAM, CPU load, disk usage progress bars, battery level/temperature, bot uptime, and clean the uploads cache (`[🧹 Clean Uploads]`) via `/server`.
+- **Paginated Directory Explorer, In-Chat Code Viewer & Instant Search 📂👁️🔎**: Navigate any number of folders with pagination (`/dir`), view code/text files directly inside Telegram with syntax highlighting and line numbers (`👁️`) or download them (`📥`) via `/files`, and search filenames/code contents instantaneously via `/find <query>`.
+- **1-Tap Quick Engineering Workflows ⚡**: Trigger common development workflows (Run Tests & Fix, Security & Bug Audit, Build & Verify, Refactor & Clean, Update Docs, Explain Architecture) with a single tap via `/quick`.
 - **Multimodal File, Photo, Voice & Audio Support 🖼️🎙️📁**: Upload source code, documents (with 1-tap Analyze/Fix/Summarize buttons or next-message auto-attachment), screenshots/photos, or voice/audio/video messages directly via Telegram, and receive generated images as inline photos or files as documents.
 - **Swipe-to-Reply Context & Interactive Question Buttons 💬**: Swipe-to-reply on any earlier message to automatically include its quoted context, and answer `ask_question` prompts via 1-tap inline buttons.
 - **Continuous Typing Indicator ✍️**: Maintains active typing status during lengthy reasoning turns.
@@ -44,18 +45,20 @@ By bridging Antigravity CLI with **Telegram**, this project unlocks the ability 
 - **Interactive Session Management 💬**: Browse recent conversations with pagination, active-session badges, and message previews from the SQLite/transcript store (`/resume`).
 - **Robust Markdown/HTML Formatting**: Custom tag-preserving parser and chunker that safely handles `<pre><code>` blocks, long single lines, expandable blockquotes, and automatic Markdown table-to-bullet conversion for mobile screens.
 - **Slash Commands**:
-    - `/status`: Interactive bot status, active step, git branch, and quick-action dashboard.
-    - `/dir`: Paginated folder explorer to switch working directories.
-    - `/files`: Browse and 1-tap download files in the current working directory.
-    - `/model`: Select and switch active AI model interactively.
-    - `/git`: Interactive Git dashboard (status, staged/unstaged diff, log, pull, AI review).
-    - `/server`: System health dashboard (RAM, CPU load, disk, battery, uptime).
+    - `/status`: Interactive bot status, session turn stats, active step, git branch, and quick-action dashboard.
+    - `/quick`: 1-tap engineering workflows (Tests, Security Audit, Build, Refactor, Docs, Architecture).
+    - `/dir [path]`: Paginated folder explorer to switch working directories.
+    - `/files`: View code/text files in-chat with syntax highlighting (`👁️`) or 1-tap download (`📥`).
+    - `/find <query>`: Instant local filename and code content search with View/Download buttons.
+    - `/model [name]`: Select AI model via inline buttons or fuzzy name match (e.g. `/model opus`).
+    - `/git`: Interactive Git dashboard (status, diff stat, full diff, commit inspector, branch switcher, pull, AI review).
+    - `/server`: System health dashboard (RAM, CPU load, disk, battery, uptime, uploads cache cleaner).
     - `/review`: Run an AI code review on uncommitted Git changes.
     - `/tasks`: Inspect active task progress and queued messages.
     - `/compact`: Compress conversation context to save memory.
     - `/getfile <path>`: Download a file from server to Telegram.
     - `/new`: Reset session and start a clean conversation.
-    - `/resume`: Paginated list of previous sessions with previews and active indicator.
+    - `/resume [query]`: Paginated list or keyword/ID-prefix search of previous sessions.
     - `/continue`: Continue the previous task where it left off.
     - `/cancel` / `/stop`: Abort the currently executing task and child processes.
     - `/restart`: Save session state and gracefully restart the bot service.
