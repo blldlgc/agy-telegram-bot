@@ -1,7 +1,9 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -12,17 +14,19 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/joho/godotenv"
 )
 
-// SessionState stores user configuration and memory
+// SessionState stores user configuration, conversation ID and process handles
 type SessionState struct {
-	WorkingDir string
-	Continue   bool
-	IsBusy     bool
-	LastActive time.Time
+	WorkingDir     string
+	ConversationID string
+	Continue       bool
+	IsBusy         bool
+	CancelFunc     context.CancelFunc
+	Cmd            *exec.Cmd
+	LastActive     time.Time
 }
 
 var (
@@ -34,7 +38,7 @@ var (
 
 	allowedUserIDs = make(map[int64]bool)
 	allowedChatIDs = make(map[int64]bool)
-	
+
 	botUsername string
 )
 
@@ -94,23 +98,28 @@ func main() {
 	if len(allowedDirs) > 0 {
 		defaultDir = allowedDirs[0]
 	} else {
-		// Fallback to current directory if not specified
 		defaultDir, _ = os.Getwd()
 		allowedDirs = append(allowedDirs, defaultDir)
 	}
 
-	log.Printf("Sandbox root: %v", allowedDirs)
+	log.Printf("Sandbox root dirs: %v", allowedDirs)
 
 	bot := NewTelegramBot(token)
+	_ = bot.DeleteWebhook()
 
 	// Set Bot Commands
 	commands := []map[string]string{
-		{"command": "new", "description": "Bắt đầu một hội thoại mới với Antigravity (dọn dẹp phiên hiện tại)"},
-		{"command": "dir", "description": "Đổi thư mục làm việc (Sandbox) - VD: /dir /path/to/dir"},
-		{"command": "goal", "description": "Thực hiện nhiệm vụ triệt để không ngắt quãng (chạy ẩn)"},
-		{"command": "grill_me", "description": "Hỏi ngược lại để làm rõ yêu cầu trước khi làm"},
-		{"command": "browser", "description": "Ép bot sử dụng trình duyệt để duyệt web"},
-		{"command": "schedule", "description": "Lên lịch hoặc hẹn giờ thực hiện tác vụ"},
+		{"command": "new", "description": "Start a fresh new conversation"},
+		{"command": "resume", "description": "List and resume previous conversations"},
+		{"command": "dir", "description": "Select or change working directory (Sandbox)"},
+		{"command": "model", "description": "Select and switch active AI model"},
+		{"command": "status", "description": "Show current model, directory, and status"},
+		{"command": "getfile", "description": "Download a file from server to Telegram"},
+		{"command": "cancel", "description": "Cancel currently running task"},
+		{"command": "restart", "description": "Restart the bot service"},
+		{"command": "goal", "description": "Execute an autonomous deep goal"},
+		{"command": "schedule", "description": "Schedule a delayed or recurring task"},
+		{"command": "help", "description": "Show commands and help guide"},
 	}
 	if err := bot.SetMyCommands(commands); err != nil {
 		log.Printf("Warning: Failed to set bot commands: %v", err)
@@ -124,7 +133,7 @@ func main() {
 		log.Printf("🤖 Bot Username: @%s", botUsername)
 	}
 
-	log.Println("Bot is now running. Press CTRL-C to exit.")
+	log.Println("Bot is running. Press CTRL-C to exit.")
 
 	// Long Polling Loop
 	for {
@@ -138,6 +147,8 @@ func main() {
 		for _, update := range updates {
 			if update.Message != nil {
 				go handleMessage(bot, update.Message)
+			} else if update.CallbackQuery != nil {
+				go handleCallbackQuery(bot, update.CallbackQuery)
 			}
 		}
 	}
@@ -149,10 +160,11 @@ func getSession(userID int64) *SessionState {
 	state, exists := sessions[userID]
 	if !exists {
 		state = &SessionState{
-			WorkingDir: defaultDir,
-			Continue:   false,
-			IsBusy:     false,
-			LastActive: time.Now(),
+			WorkingDir:     defaultDir,
+			ConversationID: "",
+			Continue:       false,
+			IsBusy:         false,
+			LastActive:     time.Now(),
 		}
 		sessions[userID] = state
 	}
@@ -160,26 +172,19 @@ func getSession(userID int64) *SessionState {
 }
 
 func isAuthorized(userID int64, chatID int64) bool {
-	// Kiểm tra Chat ID nếu có cấu hình
-	if len(allowedChatIDs) > 0 && chatID != userID { // ChatID != UserID có nghĩa là group
+	if len(allowedChatIDs) > 0 && chatID != userID {
 		if !allowedChatIDs[chatID] {
 			return false
 		}
 	}
 
-	// Nếu không cấu hình ALLOWED list nào cho User, coi như public.
 	if len(allowedUserIDs) == 0 {
 		return true
 	}
 
-	if allowedUserIDs[userID] {
-		return true
-	}
-
-	return false
+	return allowedUserIDs[userID]
 }
 
-// Hàm kiểm tra xem thư mục con có thực sự nằm trong thư mục cha không (phòng chống path traversal)
 func isSubDir(parent, child string) bool {
 	parent = filepath.Clean(parent)
 	child = filepath.Clean(child)
@@ -189,42 +194,171 @@ func isSubDir(parent, child string) bool {
 	return strings.HasPrefix(child, parent+string(filepath.Separator))
 }
 
+func handleCallbackQuery(bot *TelegramBot, cq *CallbackQuery) {
+	if cq.From == nil {
+		return
+	}
+
+	userID := cq.From.ID
+	chatID := int64(0)
+	msgID := int64(0)
+	if cq.Message != nil && cq.Message.Chat != nil {
+		chatID = cq.Message.Chat.ID
+		msgID = cq.Message.MessageID
+	}
+
+	if !isAuthorized(userID, chatID) {
+		_ = bot.AnswerCallbackQuery(cq.ID, "⛔ Unauthorized access.")
+		return
+	}
+
+	state := getSession(userID)
+	data := cq.Data
+
+	switch {
+	case data == "resume:new":
+		mu.Lock()
+		state.ConversationID = ""
+		state.Continue = false
+		mu.Unlock()
+		_ = bot.AnswerCallbackQuery(cq.ID, "🔄 Started new conversation.")
+		if chatID != 0 && msgID != 0 {
+			bot.EditMessageText(chatID, msgID, "🔄 <b>New Session:</b> Conversation history cleared. Your next message will start a fresh session.", nil, "HTML")
+		}
+
+	case strings.HasPrefix(data, "resume:"):
+		convID := strings.TrimPrefix(data, "resume:")
+		mu.Lock()
+		state.ConversationID = convID
+		state.Continue = true
+		mu.Unlock()
+		_ = bot.AnswerCallbackQuery(cq.ID, "✅ Switched to conversation.")
+		if chatID != 0 && msgID != 0 {
+			resp := formatResumeConfirmation(convID)
+			bot.EditMessageText(chatID, msgID, resp, nil, "HTML")
+		}
+
+	case data == "dir:roots":
+		text, markup := buildRootsKeyboard(allowedDirs)
+		_ = bot.AnswerCallbackQuery(cq.ID, "Root folders")
+		if chatID != 0 && msgID != 0 {
+			bot.EditMessageText(chatID, msgID, text, markup, "HTML")
+		}
+
+	case strings.HasPrefix(data, "dir:cd:"):
+		targetDir := strings.TrimPrefix(data, "dir:cd:")
+		targetDir = filepath.Clean(targetDir)
+
+		isAllowed := false
+		for _, ad := range allowedDirs {
+			if isSubDir(ad, targetDir) {
+				isAllowed = true
+				break
+			}
+		}
+
+		if !isAllowed {
+			_ = bot.AnswerCallbackQuery(cq.ID, "⛔ Directory is outside allowed sandbox paths.")
+			return
+		}
+
+		mu.Lock()
+		state.WorkingDir = targetDir
+		mu.Unlock()
+
+		_ = bot.AnswerCallbackQuery(cq.ID, fmt.Sprintf("📂 %s", filepath.Base(targetDir)))
+		if chatID != 0 && msgID != 0 {
+			text, markup := buildDirKeyboard(targetDir, allowedDirs)
+			bot.EditMessageText(chatID, msgID, text, markup, "HTML")
+		}
+
+	case strings.HasPrefix(data, "model:"):
+		modelID := strings.TrimPrefix(data, "model:")
+		err := setActiveModel(modelID)
+		if err != nil {
+			_ = bot.AnswerCallbackQuery(cq.ID, "❌ Failed to change model.")
+		} else {
+			_ = bot.AnswerCallbackQuery(cq.ID, fmt.Sprintf("✅ Model: %s", modelID))
+			if chatID != 0 && msgID != 0 {
+				resp := fmt.Sprintf("🧠 <b>Active AI Model Changed:</b>\n<code>%s</code>\n\nSubsequent requests will run with this model.", modelID)
+				bot.EditMessageText(chatID, msgID, resp, nil, "HTML")
+			}
+		}
+
+	case data == "action:continue":
+		_ = bot.AnswerCallbackQuery(cq.ID, "Continuing...")
+		go executeAgy(bot, userID, chatID, "Please continue where you left off.", false)
+
+	default:
+		_ = bot.AnswerCallbackQuery(cq.ID, "")
+	}
+}
+
 func handleMessage(bot *TelegramBot, m *Message) {
 	if m.From == nil || m.From.IsBot {
 		return
 	}
-
-	log.Printf("📥 Received message from User %d in Chat %d: %q", m.From.ID, m.Chat.ID, m.Text)
 
 	if !isAuthorized(m.From.ID, m.Chat.ID) {
 		log.Printf("⛔ Unauthorized message ignored from User %d.", m.From.ID)
 		return
 	}
 
+	// Handle Document / File upload from Telegram
+	if m.Document != nil {
+		handleIncomingDocument(bot, m)
+		return
+	}
+
+	// Handle Photo / Screenshot upload from Telegram
+	if len(m.Photo) > 0 {
+		handleIncomingPhoto(bot, m)
+		return
+	}
+
+	log.Printf("📥 Message from User %d in Chat %d: %q", m.From.ID, m.Chat.ID, m.Text)
+
 	content := strings.TrimSpace(m.Text)
 	if content == "" {
 		return
 	}
 
+	// Map persistent reply keyboard buttons to slash commands
+	switch content {
+	case "📊 Status":
+		content = "/status"
+	case "📁 Dir":
+		content = "/dir"
+	case "🧠 Model":
+		content = "/model"
+	case "🔄 Continue":
+		content = "/continue"
+	case "💬 Resume":
+		content = "/resume"
+	case "✨ New":
+		content = "/new"
+	case "🛑 Cancel":
+		content = "/cancel"
+	}
+
 	if botUsername != "" {
 		mention := "@" + botUsername
 		isGroup := m.Chat.Type == "group" || m.Chat.Type == "supergroup"
-		
+
 		if isGroup && !strings.HasPrefix(content, "/") && !strings.Contains(content, mention) {
-			return // Bỏ qua tin nhắn không tag bot trong nhóm
+			return
 		}
-		
-		// Xóa tag ra khỏi nội dung để không làm rối lệnh hoặc LLM
+
 		content = strings.Replace(content, mention, "", -1)
 		content = strings.TrimSpace(content)
 		if content == "" {
 			return
 		}
 	} else if (m.Chat.Type == "group" || m.Chat.Type == "supergroup") && !strings.HasPrefix(content, "/") {
-		return // Fallback nếu không lấy được username: chỉ nhận lệnh /
+		return
 	}
 
-	// Xử lý các lệnh Slash
+	// Slash Commands
 	if strings.HasPrefix(content, "/") {
 		parts := strings.SplitN(content, " ", 2)
 		cmd := strings.ToLower(parts[0])
@@ -236,48 +370,167 @@ func handleMessage(bot *TelegramBot, m *Message) {
 		state := getSession(m.From.ID)
 
 		switch cmd {
-		case "/goal", "/grill_me", "/browser":
-			if args == "" {
-				bot.SendMessage(m.Chat.ID, "❌ Bạn cần cung cấp tham số cho lệnh này.")
-				return
-			}
-			// Chuyển /grill_me thành /grill-me cho agy
-			internalCmd := cmd
-			if cmd == "/grill_me" {
-				internalCmd = "/grill-me"
-			}
-			
-			fullPrompt := fmt.Sprintf("%s %s", internalCmd, args)
-			bot.SendMessage(m.Chat.ID, fmt.Sprintf("⏳ **[%s]** Đã nhận lệnh, đang xử lý ngầm (có thể mất vài phút)...", cmd))
-			go executeAgy(bot, m.From.ID, m.Chat.ID, fullPrompt, true)
+		case "/start", "/help":
+			helpText := `👋 <b>Google Antigravity Telegram Assistant</b>
+
+Available commands:
+• <b>/model</b> — Select & switch active AI model
+• <b>/new</b> — Start a fresh new session
+• <b>/resume</b> — List and switch to previous conversations
+• <b>/dir</b> — Browse and change working directory
+• <b>/status</b> — View active model, directory, and session info
+• <b>/getfile &lt;path&gt;</b> — Download a file from server
+• <b>/cancel</b> — Immediately stop the running task
+• <b>/restart</b> — Restart the bot service
+• <b>/goal &lt;task&gt;</b> — Execute an autonomous deep goal
+• <b>/schedule &lt;time&gt; &lt;task&gt;</b> — Schedule a delayed or recurring task
+
+You can also send files/photos or coding questions directly!`
+			bot.SendMessageWithMarkup(m.Chat.ID, helpText, getDefaultReplyKeyboard(), "HTML")
 			return
 
-		case "/schedule":
+		case "/restart":
+			bot.SendMessage(m.Chat.ID, "🔄 <b>Restarting bot...</b> (New instance will be active in 1 second)", "HTML")
+			bot.ConfirmUpdates()
+			time.Sleep(300 * time.Millisecond)
+			os.Exit(0)
+			return
+
+		case "/continue":
+			go executeAgy(bot, m.From.ID, m.Chat.ID, "Please continue where you left off.", false)
+			return
+
+		case "/model":
+			text, markup := buildModelKeyboard()
+			bot.SendMessageWithMarkup(m.Chat.ID, text, markup, "HTML")
+			return
+
+		case "/getfile", "/file", "/download":
 			if args == "" {
-				bot.SendMessage(m.Chat.ID, "❌ Bạn cần cung cấp thời gian và nhiệm vụ (VD: /schedule in 5m say hello).")
+				bot.SendMessage(m.Chat.ID, "❌ Please specify a file path (e.g. <code>/getfile main.go</code>).", "HTML")
 				return
 			}
-			fullPrompt := fmt.Sprintf("/schedule %s", args)
-			bot.SendMessage(m.Chat.ID, "⏳ **[/schedule]** Đang thiết lập lịch trình...")
-			go executeAgy(bot, m.From.ID, m.Chat.ID, fullPrompt, true)
+			mu.RLock()
+			currentDir := state.WorkingDir
+			mu.RUnlock()
+
+			var targetPath string
+			if filepath.IsAbs(args) {
+				targetPath = filepath.Clean(args)
+			} else {
+				targetPath = filepath.Clean(filepath.Join(currentDir, args))
+			}
+
+			isAllowed := false
+			for _, ad := range allowedDirs {
+				if isSubDir(ad, targetPath) {
+					isAllowed = true
+					break
+				}
+			}
+			if !isAllowed {
+				bot.SendMessage(m.Chat.ID, "⛔ File is outside allowed sandbox paths.")
+				return
+			}
+
+			info, err := os.Stat(targetPath)
+			if err != nil || info.IsDir() {
+				bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ File not found: <code>%s</code>", escapeTelegram(filepath.Base(targetPath))), "HTML")
+				return
+			}
+
+			caption := fmt.Sprintf("📄 <code>%s</code> (%.1f KB)", filepath.Base(targetPath), float64(info.Size())/1024.0)
+			_, err = bot.SendDocument(m.Chat.ID, targetPath, caption)
+			if err != nil {
+				bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to send document: %v", err))
+			}
+			return
+
+		case "/status":
+			mu.RLock()
+			busy := state.IsBusy
+			workDir := state.WorkingDir
+			convID := state.ConversationID
+			mu.RUnlock()
+
+			model := getActiveModel()
+			statusStr := "🟢 Idle"
+			if busy {
+				statusStr = "🟡 Running Task"
+			}
+			convStr := "<i>New Session</i>"
+			if convID != "" {
+				convStr = fmt.Sprintf("<code>%s</code>", convID)
+			}
+
+			statusMsg := fmt.Sprintf(`🤖 <b>Antigravity Status:</b>
+
+• <b>Model:</b> <i>%s</i>
+• <b>Working Directory:</b> <code>%s</code>
+• <b>Conversation:</b> %s
+• <b>Status:</b> %s`, model, shortenHomeDir(workDir), convStr, statusStr)
+
+			bot.SendMessage(m.Chat.ID, statusMsg, "HTML")
+			return
+
+		case "/cancel", "/stop":
+			mu.Lock()
+			busy := state.IsBusy
+			cancel := state.CancelFunc
+			cmdProc := state.Cmd
+			mu.Unlock()
+
+			if !busy || cancel == nil {
+				bot.SendMessage(m.Chat.ID, "ℹ️ No task is currently running.")
+				return
+			}
+
+			cancel()
+			if cmdProc != nil && cmdProc.Process != nil {
+				_ = cmdProc.Process.Kill()
+			}
+			bot.SendMessage(m.Chat.ID, "🛑 <b>Task cancelled.</b>", "HTML")
+			return
+
+		case "/resume":
+			if args != "" {
+				mu.Lock()
+				state.ConversationID = args
+				state.Continue = true
+				mu.Unlock()
+				bot.SendMessage(m.Chat.ID, formatResumeConfirmation(args), "HTML")
+				return
+			}
+			text, markup, err := buildResumeKeyboard()
+			if err != nil {
+				bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to read conversation history: %v", err))
+				return
+			}
+			bot.SendMessageWithMarkup(m.Chat.ID, text, markup, "HTML")
 			return
 
 		case "/new":
 			mu.Lock()
+			state.ConversationID = ""
 			state.Continue = false
 			mu.Unlock()
-			bot.SendMessage(m.Chat.ID, "🔄 Hệ thống đã sẵn sàng khởi tạo hội thoại mới ở tin nhắn tiếp theo!")
+			bot.SendMessage(m.Chat.ID, "🔄 Session reset. Your next message will start a fresh conversation!")
 			return
 
 		case "/dir":
 			if args == "" {
-				bot.SendMessage(m.Chat.ID, "❌ Bạn cần cung cấp đường dẫn thư mục.")
+				mu.RLock()
+				curDir := state.WorkingDir
+				mu.RUnlock()
+				text, markup := buildDirKeyboard(curDir, allowedDirs)
+				bot.SendMessageWithMarkup(m.Chat.ID, text, markup, "HTML")
 				return
 			}
+
 			reqDir := args
-			mu.Lock()
+			mu.RLock()
 			currentDir := state.WorkingDir
-			mu.Unlock()
+			mu.RUnlock()
 
 			var targetDir string
 			if filepath.IsAbs(reqDir) {
@@ -294,40 +547,183 @@ func handleMessage(bot *TelegramBot, m *Message) {
 				}
 			}
 
-			var responseContent string
 			if !isAllowed {
-				responseContent = "⛔ Thư mục này không nằm trong danh sách Sandbox được phép (ALLOWED_DIRS)."
-			} else {
-				info, err := os.Stat(targetDir)
-				if os.IsNotExist(err) {
-					err = os.MkdirAll(targetDir, 0755)
-					if err != nil {
-						responseContent = fmt.Sprintf("❌ Không thể tạo thư mục mới `%s`:\n%v", targetDir, err)
-					} else {
-						responseContent = fmt.Sprintf("📂 Đã tạo mới và chuyển tới thư mục: `%s`", targetDir)
-						mu.Lock()
-						state.WorkingDir = targetDir
-						mu.Unlock()
-					}
-				} else if err != nil {
-					responseContent = fmt.Sprintf("❌ Lỗi khi đọc đường dẫn: %v", err)
-				} else if !info.IsDir() {
-					responseContent = fmt.Sprintf("❌ `%s` là một file, không phải là thư mục!", targetDir)
-				} else {
-					responseContent = fmt.Sprintf("📂 Đã đổi thư mục làm việc sang: `%s`", targetDir)
-					mu.Lock()
-					state.WorkingDir = targetDir
-					mu.Unlock()
-				}
+				bot.SendMessage(m.Chat.ID, "⛔ Directory is outside allowed sandbox paths (ALLOWED_DIRS).")
+				return
 			}
-			bot.SendMessage(m.Chat.ID, responseContent)
+
+			info, err := os.Stat(targetDir)
+			if os.IsNotExist(err) {
+				err = os.MkdirAll(targetDir, 0755)
+				if err != nil {
+					bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to create directory: %v", err))
+					return
+				}
+			} else if err != nil {
+				bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Directory error: %v", err))
+				return
+			} else if !info.IsDir() {
+				bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ `%s` is not a directory!", targetDir))
+				return
+			}
+
+			mu.Lock()
+			state.WorkingDir = targetDir
+			mu.Unlock()
+			bot.SendMessage(m.Chat.ID, fmt.Sprintf("📂 Working directory changed to: <code>%s</code>", shortenHomeDir(targetDir)), "HTML")
+			return
+
+		case "/goal", "/grill_me", "/grill-me", "/browser", "/plan", "/boost":
+			if args == "" {
+				bot.SendMessage(m.Chat.ID, "❌ Please specify a prompt or task for this command.")
+				return
+			}
+			internalCmd := cmd
+			if cmd == "/grill_me" {
+				internalCmd = "/grill-me"
+			}
+			fullPrompt := fmt.Sprintf("%s %s", internalCmd, args)
+			go executeAgy(bot, m.From.ID, m.Chat.ID, fullPrompt, true)
+			return
+
+		case "/schedule":
+			if args == "" {
+				bot.SendMessage(m.Chat.ID, "❌ Please specify time and task (e.g., /schedule in 5m remind me).")
+				return
+			}
+			fullPrompt := fmt.Sprintf("/schedule %s", args)
+			go executeAgy(bot, m.From.ID, m.Chat.ID, fullPrompt, true)
 			return
 		}
 	}
 
 	// Normal text message
-	bot.SendChatAction(m.Chat.ID, "typing")
 	executeAgy(bot, m.From.ID, m.Chat.ID, content, false)
+}
+
+// getUploadsDir returns the dedicated fixed directory under the bot folder for incoming files/photos
+func getUploadsDir() string {
+	exePath, err := os.Executable()
+	var baseDir string
+	if err == nil {
+		baseDir = filepath.Dir(exePath)
+	} else {
+		baseDir, _ = os.Getwd()
+	}
+	uploadsDir := filepath.Join(baseDir, "uploads")
+	_ = os.MkdirAll(uploadsDir, 0755)
+	return uploadsDir
+}
+
+func handleIncomingDocument(bot *TelegramBot, m *Message) {
+	if m.From == nil || m.Document == nil {
+		return
+	}
+	if !isAuthorized(m.From.ID, m.Chat.ID) {
+		return
+	}
+	uploadsDir := getUploadsDir()
+
+	fileInfo, err := bot.GetFile(m.Document.FileID)
+	if err != nil {
+		bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to get file details: %v", err))
+		return
+	}
+
+	saveName := filepath.Base(m.Document.FileName)
+	if saveName == "" || saveName == "." {
+		saveName = fmt.Sprintf("file_%s", time.Now().Format("20060102_150405"))
+	}
+	destPath := filepath.Join(uploadsDir, saveName)
+
+	if err := bot.DownloadFile(fileInfo.FilePath, destPath); err != nil {
+		bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to download file: %v", err))
+		return
+	}
+
+	ackText := fmt.Sprintf("📥 <b>File saved:</b> <code>%s</code> (%.1f KB)\n📂 Location: <code>%s</code>", saveName, float64(m.Document.FileSize)/1024.0, shortenHomeDir(destPath))
+
+	caption := strings.TrimSpace(m.Caption)
+	if caption != "" {
+		bot.SendMessage(m.Chat.ID, ackText, "HTML")
+		prompt := fmt.Sprintf("I uploaded a file at '%s'. %s", destPath, caption)
+		executeAgy(bot, m.From.ID, m.Chat.ID, prompt, false)
+	} else {
+		bot.SendMessage(m.Chat.ID, ackText, "HTML")
+	}
+}
+
+func handleIncomingPhoto(bot *TelegramBot, m *Message) {
+	if m.From == nil || len(m.Photo) == 0 {
+		return
+	}
+	if !isAuthorized(m.From.ID, m.Chat.ID) {
+		return
+	}
+	uploadsDir := getUploadsDir()
+
+	bestPhoto := m.Photo[len(m.Photo)-1]
+	fileInfo, err := bot.GetFile(bestPhoto.FileID)
+	if err != nil {
+		bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to get photo details: %v", err))
+		return
+	}
+
+	ext := filepath.Ext(fileInfo.FilePath)
+	if ext == "" {
+		ext = ".jpg"
+	}
+	saveName := fmt.Sprintf("photo_%s%s", time.Now().Format("20060102_150405"), ext)
+	destPath := filepath.Join(uploadsDir, saveName)
+
+	if err := bot.DownloadFile(fileInfo.FilePath, destPath); err != nil {
+		bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to download photo: %v", err))
+		return
+	}
+
+	ackText := fmt.Sprintf("🖼️ <b>Photo saved:</b> <code>%s</code> (%.1f KB)\n📂 Location: <code>%s</code>", saveName, float64(bestPhoto.FileSize)/1024.0, shortenHomeDir(destPath))
+	bot.SendMessage(m.Chat.ID, ackText, "HTML")
+
+	caption := strings.TrimSpace(m.Caption)
+	var prompt string
+	if caption != "" {
+		prompt = fmt.Sprintf("User uploaded an image/screenshot at '%s'. Please inspect this image file (using read_file) and fulfill the following request: %s", destPath, caption)
+	} else {
+		prompt = fmt.Sprintf("User uploaded an image/screenshot at '%s'. Please inspect this image file (using read_file), analyze its contents, and if you see an error or issue, explain the solution.", destPath)
+	}
+	executeAgy(bot, m.From.ID, m.Chat.ID, prompt, false)
+}
+
+// EventPayload for parsing agy --output-format stream-json
+type EventPayload struct {
+	Event          string `json:"event"`
+	ConversationID string `json:"conversation_id,omitempty"`
+	StepUpdate     *struct {
+		StepIndex int    `json:"step_index"`
+		State     string `json:"state"`
+		StepType  string `json:"step_type"`
+		ToolName  string `json:"tool_name,omitempty"`
+		ToolInfo  struct {
+			Name       string                 `json:"name"`
+			Parameters map[string]interface{} `json:"parameters"`
+		} `json:"tool_info,omitempty"`
+		TextDelta string `json:"text_delta,omitempty"`
+	} `json:"step_update,omitempty"`
+	Result *struct {
+		ConversationID string `json:"conversation_id"`
+		Status         string `json:"status"`
+		Response       string `json:"response"`
+	} `json:"result,omitempty"`
+}
+
+func truncateStr(s string, max int) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\n", " ")
+	runes := []rune(s)
+	if len(runes) > max {
+		return string(runes[:max-2]) + ".."
+	}
+	return s
 }
 
 func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, isBackground bool) {
@@ -335,13 +731,13 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 
 	cmdPath := os.Getenv("ANTIGRAVITY_CMD")
 	if cmdPath == "" {
-		cmdPath = "agy" // default binary
+		cmdPath = "agy"
 	}
 
 	mu.Lock()
-	// Tự động reset nếu quá 2 tiếng không tương tác (chỉ áp dụng cho normal chat)
 	if !isBackground && time.Since(state.LastActive) > 2*time.Hour {
 		state.Continue = false
+		state.ConversationID = ""
 	}
 	if !isBackground {
 		state.LastActive = time.Now()
@@ -349,7 +745,7 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 
 	if !isBackground && state.IsBusy {
 		mu.Unlock()
-		bot.SendMessage(chatID, "⏳ **Hệ thống đang bận:** Bot đang xử lý một yêu cầu trước đó của bạn. Vui lòng chờ lệnh hoàn tất trước khi gửi yêu cầu mới.")
+		bot.SendMessage(chatID, "⏳ <b>System Busy:</b> The bot is currently processing another request. Please wait or use <b>/cancel</b> to stop.", "HTML")
 		return
 	}
 
@@ -357,168 +753,295 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 		state.IsBusy = true
 	}
 
-	continueFlag := state.Continue
+	convID := state.ConversationID
+	contFlag := state.Continue
+	workDir := state.WorkingDir
 
-	if isBackground {
-		state.Continue = false
+	ctx, cancel := context.WithCancel(context.Background())
+	if !isBackground {
+		state.CancelFunc = cancel
 	}
 	mu.Unlock()
 
-	if !isBackground {
-		defer func() {
+	defer func() {
+		if !isBackground {
 			mu.Lock()
 			state.IsBusy = false
+			state.CancelFunc = nil
+			state.Cmd = nil
 			mu.Unlock()
-		}()
+		}
+	}()
+
+	// Send initial status message
+	initText := "⏳ <i>Antigravity is starting...</i>"
+	if isBackground {
+		initText = "⏳ <b>[Background]</b> Task initiated..."
+	}
+	statusMsg, err := bot.SendMessage(chatID, initText, "HTML")
+	statusMsgID := int64(0)
+	if err == nil && statusMsg != nil {
+		statusMsgID = statusMsg.MessageID
 	}
 
-	// Chuẩn bị tham số cho agy
+	// Prepare arguments
+	uploadsDir := getUploadsDir()
 	args := []string{
 		"--sandbox",
-		"--add-dir", state.WorkingDir,
+		"--add-dir", workDir,
+		"--add-dir", uploadsDir,
 		"--dangerously-skip-permissions",
-		"--print-timeout", "720h", // Mở rộng thời gian chờ lên tới 30 ngày cho các lệnh /goal, /schedule
+		"--output-format", "stream-json",
 	}
 
-	if continueFlag {
+	if isBackground {
+		args = append(args, "--print-timeout", "720h")
+	}
+
+	if convID != "" {
+		args = append(args, "--conversation", convID)
+	} else if contFlag {
 		args = append(args, "-c")
 	}
 
-	// Thêm nội dung prompt vào cuối cùng cấu hình ẩn
-	sysPrompt := "\n\n(Lưu ý từ hệ thống: Tuyệt đối không sử dụng định dạng bảng (table). Hãy trình bày dưới dạng danh sách (bullet list) có in đậm/in nghiêng để dễ đọc trên điện thoại. Hãy giữ nội dung ngắn gọn và súc tích nhất có thể. QUAN TRỌNG: Bạn BẮT BUỘC phải bọc toàn bộ nội dung câu trả lời cuối cùng dành cho người dùng vào giữa cặp thẻ <BOT_REPLY> và </BOT_REPLY>. Bất kỳ suy nghĩ hoặc phần log nào của bạn phải nằm ngoài thẻ này để hệ thống có thể lọc bỏ.)"
+	activeModel := getActiveModel()
+	if activeModel != "" {
+		args = append(args, "--model", activeModel)
+	}
+
+	sysPrompt := "\n\n(System rule: Avoid markdown tables. Use bold/italic bullet points for mobile readability. Be concise, clear, and direct. VERY IMPORTANT: Enclose your final user-facing response strictly between <BOT_REPLY> and </BOT_REPLY> tags. Keep internal thoughts or logs outside these tags.)"
 	args = append(args, "-p", content+sysPrompt)
 
-	log.Printf("Executing for %d in %s: %s", userID, state.WorkingDir, cmdPath)
+	log.Printf("Executing for %d in %s: %s (conv: %s, model: %s)", userID, workDir, cmdPath, convID, activeModel)
 
-	cmd := exec.Command(cmdPath, args...)
-	cmd.Dir = state.WorkingDir
+	cmd := exec.CommandContext(ctx, cmdPath, args...)
+	cmd.Dir = workDir
 
-	var out bytes.Buffer
-	var errOut bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errOut
+	mu.Lock()
+	state.Cmd = cmd
+	mu.Unlock()
 
-	// Bắt đầu vòng lặp gửi "typing..." liên tục để user biết bot vẫn đang sống
-	done := make(chan bool)
-	if !isBackground {
-		go func() {
-			for {
-				select {
-				case <-done:
-					return
-				case <-time.After(4 * time.Second):
-					bot.SendChatAction(chatID, "typing")
-				}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		bot.SendMessage(chatID, fmt.Sprintf("❌ Stdout error: %v", err))
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		bot.SendMessage(chatID, fmt.Sprintf("❌ Stderr error: %v", err))
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		bot.SendMessage(chatID, fmt.Sprintf("❌ Failed to start process: %v", err))
+		return
+	}
+
+	startTime := time.Now()
+
+	// Continuous typing heartbeat
+	stopTyping := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		_ = bot.SendChatAction(chatID, "typing")
+		for {
+			select {
+			case <-stopTyping:
+				return
+			case <-ticker.C:
+				_ = bot.SendChatAction(chatID, "typing")
 			}
-		}()
+		}
+	}()
+	defer close(stopTyping)
+
+	var finalResponse string
+	var capturedConvID string
+	var rawOutput strings.Builder
+	var lastStatusUpdate time.Time
+	var statusMu sync.Mutex
+
+	updateStatus := func(newStatus string) {
+		statusMu.Lock()
+		defer statusMu.Unlock()
+		if statusMsgID == 0 {
+			return
+		}
+		if time.Since(lastStatusUpdate) < 1500*time.Millisecond {
+			return
+		}
+		lastStatusUpdate = time.Now()
+		_, _ = bot.EditMessageText(chatID, statusMsgID, newStatus, nil, "HTML")
 	}
 
-	err := cmd.Run()
-	
-	if !isBackground {
-		done <- true // Dừng vòng lặp typing
-	}
-	
-	result := out.String()
-	errStr := errOut.String()
+	// Read stdout stream
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		// Increase buffer size for large NDJSON lines
+		buf := make([]byte, 1024*1024)
+		scanner.Buffer(buf, 10*1024*1024)
 
-	if errStr != "" {
-		result += "\n[STDERR]\n" + errStr
-	}
+		for scanner.Scan() {
+			line := scanner.Text()
+			rawOutput.WriteString(line + "\n")
 
-	// Lọc kết quả để lấy nội dung trong thẻ <BOT_REPLY> (nếu có)
-	re := regexp.MustCompile(`(?s)<BOT_REPLY>(.*?)</BOT_REPLY>`)
-	matches := re.FindAllStringSubmatch(result, -1)
-	if len(matches) > 0 {
-		result = matches[len(matches)-1][1]
-	} else if result != "" {
-		// Fallback: Xóa các dòng điển hình của thoughts nếu model quên in thẻ
-		lines := strings.Split(result, "\n")
-		var filtered []string
-		for _, line := range lines {
-			lowerLine := strings.ToLower(strings.TrimSpace(line))
-			if strings.HasPrefix(lowerLine, "i will ") ||
-				strings.HasPrefix(lowerLine, "i am going to ") ||
-				strings.HasPrefix(lowerLine, "i need to ") ||
-				strings.HasPrefix(lowerLine, "let me ") {
+			if !strings.HasPrefix(line, "{") {
 				continue
 			}
-			filtered = append(filtered, line)
+
+			var payload EventPayload
+			if err := json.Unmarshal([]byte(line), &payload); err != nil {
+				continue
+			}
+
+			if payload.ConversationID != "" {
+				capturedConvID = payload.ConversationID
+			}
+
+			if payload.Event == "step_update" && payload.StepUpdate != nil {
+				su := payload.StepUpdate
+				if su.State == "ACTIVE" {
+					if su.StepType == "tool" {
+						toolName := su.ToolName
+						if toolName == "" && su.ToolInfo.Name != "" {
+							toolName = su.ToolInfo.Name
+						}
+						detail := ""
+						if cmdLine, ok := su.ToolInfo.Parameters["CommandLine"].(string); ok {
+							detail = truncateStr(cmdLine, 40)
+						} else if path, ok := su.ToolInfo.Parameters["TargetFile"].(string); ok {
+							detail = truncateStr(filepath.Base(path), 35)
+						} else if path, ok := su.ToolInfo.Parameters["AbsolutePath"].(string); ok {
+							detail = truncateStr(filepath.Base(path), 35)
+						} else if q, ok := su.ToolInfo.Parameters["query"].(string); ok {
+							detail = truncateStr(q, 35)
+						}
+
+						statusText := fmt.Sprintf("⚡ <b>Running:</b> <code>[%s]</code>", toolName)
+						if detail != "" {
+							statusText = fmt.Sprintf("⚡ <b>Running:</b> <code>[%s]</code>\n<code>%s</code>", toolName, escapeTelegram(detail))
+						}
+						updateStatus(statusText)
+					} else if su.StepType == "agent_response" {
+						updateStatus("✍️ <i>Preparing response...</i>")
+					}
+				}
+			} else if payload.Event == "result" && payload.Result != nil {
+				finalResponse = payload.Result.Response
+				if payload.Result.ConversationID != "" {
+					capturedConvID = payload.Result.ConversationID
+				}
+			}
 		}
-		result = strings.Join(filtered, "\n")
-	}
+	}()
 
-	result = strings.TrimSpace(result)
-	if result == "" {
-		if err != nil {
-			result = fmt.Sprintf("Lệnh hoàn tất với lỗi: %v\n\n[Raw Output]:\n%s", err, out.String())
-		} else {
-			result = "Lệnh hoàn tất."
+	// Read stderr in background
+	var stderrOutput strings.Builder
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			stderrOutput.WriteString(scanner.Text() + "\n")
 		}
-	}
-	
-	if err == nil && !isBackground {
-		mu.Lock()
-		state.Continue = true
-		mu.Unlock()
-	}
+	}()
 
-	sendLongMessage(bot, chatID, result)
-}
+	err = cmd.Wait()
 
-func sendLongMessage(bot *TelegramBot, chatID int64, text string) {
-	// Format văn bản Markdown sang HTML cho Telegram
-	text = formatTelegramHTML(text)
-
-	// Telegram limits messages to 4096 chars. We use 4000 to be safe.
-	const maxLen = 4000
-	if utf8.RuneCountInString(text) <= maxLen {
-		if err := bot.SendMessage(chatID, text, "HTML"); err != nil {
-			log.Printf("Error sending message: %v", err)
-			// Nếu lỗi do HTML parse (ví dụ unclosed tag), gửi lại dạng text thường
-			bot.SendMessage(chatID, text)
+	// Handle cancellation
+	if ctx.Err() != nil {
+		if statusMsgID != 0 {
+			bot.EditMessageText(chatID, statusMsgID, "🛑 <b>Task cancelled.</b>", nil, "HTML")
 		}
 		return
 	}
 
-	// Split by chunks
-	runes := []rune(text)
-	for i := 0; i < len(runes); i += maxLen {
-		end := i + maxLen
-		if end > len(runes) {
-			end = len(runes)
+	// Update conversation ID
+	if capturedConvID != "" {
+		mu.Lock()
+		state.ConversationID = capturedConvID
+		state.Continue = true
+		mu.Unlock()
+	}
+
+	resultText := finalResponse
+	if resultText == "" {
+		resultText = rawOutput.String()
+	}
+
+	// Extract content from <BOT_REPLY> tag
+	re := regexp.MustCompile(`(?s)<BOT_REPLY>(.*?)</BOT_REPLY>`)
+	matches := re.FindAllStringSubmatch(resultText, -1)
+	if len(matches) > 0 {
+		resultText = matches[len(matches)-1][1]
+	} else if resultText != "" {
+		lines := strings.Split(resultText, "\n")
+		var filtered []string
+		for _, line := range lines {
+			lower := strings.ToLower(strings.TrimSpace(line))
+			if strings.HasPrefix(lower, "i will ") ||
+				strings.HasPrefix(lower, "i am going to ") ||
+				strings.HasPrefix(lower, "i need to ") ||
+				strings.HasPrefix(lower, "let me ") {
+				continue
+			}
+			filtered = append(filtered, line)
 		}
-		err := bot.SendMessage(chatID, string(runes[i:end]), "HTML")
+		resultText = strings.Join(filtered, "\n")
+	}
+
+	resultText = strings.TrimSpace(resultText)
+	if resultText == "" {
 		if err != nil {
-			log.Printf("Error sending message chunk: %v", err)
-			bot.SendMessage(chatID, string(runes[i:end]))
+			resultText = fmt.Sprintf("Command failed with error: %v\n\n%s", err, stderrOutput.String())
+		} else {
+			resultText = "Task completed."
 		}
 	}
-}
 
-// formatTelegramHTML converts standard markdown to Telegram-compatible HTML
-func formatTelegramHTML(text string) string {
-	// 1. Convert < and > outside of tags (basic escaping to prevent telegram api error)
-	// We do a simple replace first. Note: If agy returns actual HTML, this will escape it.
-	text = strings.ReplaceAll(text, "<", "&lt;")
-	text = strings.ReplaceAll(text, ">", "&gt;")
+	elapsed := time.Since(startTime)
+	durStr := fmt.Sprintf("%.1fs", elapsed.Seconds())
+	if elapsed > time.Minute {
+		durStr = fmt.Sprintf("%dm %ds", int(elapsed.Minutes()), int(elapsed.Seconds())%60)
+	}
 
-	// 2. Convert code blocks ```...``` to <pre>...</pre>
-	rePre := regexp.MustCompile("(?s)```[a-zA-Z]*\n(.*?)\n?```")
-	text = rePre.ReplaceAllString(text, "<pre>$1</pre>")
+	// Update live status message to completed
+	if statusMsgID != 0 {
+		statusDone := fmt.Sprintf("✅ <b>Task complete</b> <i>(took %s)</i>", durStr)
+		_, _ = bot.EditMessageText(chatID, statusMsgID, statusDone, nil, "HTML")
+	}
 
-	// 3. Convert inline code `...` to <code>...</code>
-	reCode := regexp.MustCompile("`([^`]+)`")
-	text = reCode.ReplaceAllString(text, "<code>$1</code>")
+	// Append dynamic footer showing active model and working directory
+	footer := fmt.Sprintf("\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n🤖 <i>%s</i> | 📂 <code>%s</code>", activeModel, shortenHomeDir(workDir))
+	resultText += footer
 
-	// 4. Convert bold **...** to <b>...</b>
-	reBold := regexp.MustCompile(`\*\*(.+?)\*\*`)
-	text = reBold.ReplaceAllString(text, "<b>$1</b>")
+	// Add proactive notification alert header if long task or background
+	prefix := ""
+	if isBackground || elapsed > 15*time.Second {
+		prefix = fmt.Sprintf("🔔 <b>Task Complete!</b> <i>(Duration: %s)</i>\n\n", durStr)
+	}
 
-	// 5. Convert italic *...* to <i>...</i>
-	// Careful not to match bullet points (which have a space after *)
-	reItalic := regexp.MustCompile(`(?m)(^|[^\*])\*([^\*\s][^\*]*[^\*\s]|[^\*\s])\*([^\*]|$)`)
-	text = reItalic.ReplaceAllString(text, "$1<i>$2</i>$3")
+	// Format with new rock-solid Telegram HTML converter
+	htmlContent := FormatTelegramHTML(resultText)
+	chunks := SplitTelegramHTML(htmlContent, 3800)
 
-	return text
+	// Send final response as NEW message (triggers Telegram push notification & sound on phone!)
+	if len(chunks) > 0 {
+		chunks[0] = prefix + chunks[0]
+
+		replyMarkup := getDefaultReplyKeyboard()
+		_, err := bot.SendMessageWithMarkup(chatID, chunks[0], replyMarkup, "HTML")
+		if err != nil {
+			log.Printf("SendMessage HTML parse error: %v, falling back to plain text", err)
+			_, _ = bot.SendMessageWithMarkup(chatID, StripHTML(chunks[0]), replyMarkup)
+		}
+
+		// Send additional chunks if message was split
+		for i := 1; i < len(chunks); i++ {
+			_, err := bot.SendMessage(chatID, chunks[i], "HTML")
+			if err != nil {
+				log.Printf("SendMessage chunk HTML parse error: %v, falling back to plain text", err)
+				_, _ = bot.SendMessage(chatID, StripHTML(chunks[i]))
+			}
+		}
+	}
 }

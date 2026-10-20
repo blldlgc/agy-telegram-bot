@@ -1,8 +1,8 @@
-# Antigravity Telegram Gateway (Go Version)
+# 🌌 Telegravity — A Telegram Bot for Antigravity CLI
 
 *[Đọc bản Tiếng Việt (Vietnamese version)](docs/README-vi.md)*
 
-A Telegram Bot written in Golang, acting as a gateway bridge for [Antigravity CLI](https://dev.to/arindam_1729/antigravity-cli-a-hands-on-guide-to-googles-terminal-coding-agent-5bc7). This version **operates independently**, not using any 3rd-party API wrappers to ensure maximum security, directly communicating with Telegram via RAW HTTP.
+**Telegravity** is a fast, lightweight Telegram Bot written in Golang, acting as an interactive remote gateway and live-streaming bridge for [Antigravity CLI](https://dev.to/arindam_1729/antigravity-cli-a-hands-on-guide-to-googles-terminal-coding-agent-5bc7). This version **operates independently**, not using any 3rd-party API wrappers to ensure maximum security, directly communicating with Telegram via RAW HTTP.
 
 This document provides a detailed guide on how to configure the Telegram Bot with BotFather, install, secure, and run the bot 24/7.
 
@@ -28,18 +28,31 @@ By bridging Antigravity CLI with **Telegram**, this project unlocks the ability 
 
 ## 🌟 Key Features
 
-- **Absolute Security**: API calls are made directly via `net/http` without potentially risky wrappers.
-- **Sandbox Security 🛡️**: Restricts the AI to read/write files ONLY within pre-authorized directories (`ALLOWED_DIRS`).
-- **Access Control (Whitelist)**: Only serves pre-configured User IDs or Chat Group IDs.
-- **Concurrency Lock**: Prevents bot spamming, ensuring each user runs only one main thread at a time.
-- **Long Message Support**: Automatically splits (chunks) responses when the AI's output exceeds Telegram's 4096-character limit.
+- **Absolute Security**: API calls are made directly via standard `net/http` without 3rd-party wrappers.
+- **Sandbox Security 🛡️**: Restricts the AI to read/write files strictly within authorized directories (`ALLOWED_DIRS`).
+- **Access Control (Whitelist)**: Only responds to authorized Telegram user IDs or group chat IDs.
+- **Real-Time Live Updates & Push Alerts ⚡**: Streams tool execution steps live into Telegram (`⚡ Running: [tool]`), and delivers the completed result as a new message to guarantee mobile push notifications and vibration.
+- **Continuous Typing Indicator ✍️**: Maintains active typing status during lengthy reasoning turns.
+- **Dynamic AI Model Switcher 🧠**: Switch models (`Gemini 3.8 Flash`, `Gemini 4 Argon`, `Claude Sonnet/Opus`) on the fly via `/model` with inline buttons.
+- **Bi-Directional File & Photo Support 🖼️📁**: Upload source code, documents, or screenshots/photos directly via Telegram for the AI agent to inspect, or download server files to Telegram using `/getfile <path>`.
+- **Persistent Mobile Reply Keyboard 📱**: Quick bottom buttons (`Status`, `Dir`, `Model`, `Resume`, `New`, `Cancel`, `Restart`) designed for seamless phone ergonomics.
+- **Instant Task Cancellation 🛑**: Stop long-running or stuck tasks immediately with `/cancel` or `/stop`.
+- **Interactive Session Management 💬**: Browse recent conversations with message previews from the SQLite/transcript store and resume sessions interactively via inline buttons (`/resume`).
+- **Interactive Directory Browser 📂**: Navigate folders and switch working directories using interactive inline keyboards (`/dir`).
+- **Robust Markdown/HTML Formatting**: Custom tag-preserving parser and chunker that safely handles code blocks, nested tags, and message splits without Telegram parse errors.
 - **Slash Commands**:
-    - `/new`: Start a brand-new conversation.
-    - `/dir <path>`: Change the working directory (Sandbox).
-    - `/goal <prompt>`: Run a fully autonomous task in the background.
-    - `/grill_me <prompt>`: Force the bot to ask you questions to clarify an idea.
-    - `/browser <prompt>`: Force the bot to use a browser.
-    - `/schedule <time> <prompt>`: Schedule a command execution.
+    - `/model`: Select and switch active AI model interactively.
+    - `/getfile <path>`: Download a file from server to Telegram.
+    - `/new`: Reset session and start a clean conversation.
+    - `/resume`: List previous sessions with interactive buttons to switch.
+    - `/continue`: Continue the previous task where it left off.
+    - `/dir`: Browse and change working directory via interactive buttons.
+    - `/status`: Display current AI model, active directory, conversation ID, and bot status.
+    - `/cancel` / `/stop`: Abort the currently executing task.
+    - `/restart`: Gracefully restart the bot service.
+    - `/goal <prompt>`: Execute an autonomous deep task in the background.
+    - `/schedule <time> <prompt>`: Schedule a delayed or recurring task.
+    - `/help`: Display help and command usage.
 
 ---
 
