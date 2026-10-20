@@ -43,6 +43,7 @@ type SessionState struct {
 	PendingFiles     []string
 	TurnsCompleted   int
 	LastTaskDuration string
+	LastUserPrompt   string
 }
 
 var (
@@ -146,6 +147,9 @@ func main() {
 		{"command": "quick", "description": "1-tap engineering workflows (test, audit, build)"},
 		{"command": "dir", "description": "Browse & switch working directory (Sandbox)"},
 		{"command": "files", "description": "View code in-chat or download directory files"},
+		{"command": "find", "description": "Instant local file & code content search"},
+		{"command": "sh", "description": "Run a fast local shell command in working dir"},
+		{"command": "export", "description": "Download current workspace as a clean ZIP archive"},
 		{"command": "model", "description": "Select and switch active AI model"},
 		{"command": "git", "description": "Interactive Git status, diff, log, branches & review"},
 		{"command": "server", "description": "System health, RAM, CPU, disk & battery dashboard"},
@@ -548,6 +552,26 @@ func handleCallbackQuery(bot *TelegramBot, cq *CallbackQuery) {
 			}
 		}
 
+	case strings.HasPrefix(data, "dir:zip:"):
+		token := strings.TrimPrefix(data, "dir:zip:")
+		targetDir := filepath.Clean(resolveDirToken(token))
+		if !isPathAllowed(targetDir) {
+			_ = bot.AnswerCallbackQuery(cq.ID, "⛔ Outside sandbox paths.")
+			return
+		}
+		_ = bot.AnswerCallbackQuery(cq.ID, "📦 Creating ZIP archive...")
+		zipPath, count, zipSize, err := exportDirToZip(targetDir)
+		if err != nil {
+			bot.SendMessage(chatID, fmt.Sprintf("❌ Failed to create ZIP archive: %v", err))
+			return
+		}
+		defer os.Remove(zipPath)
+		caption := fmt.Sprintf("📦 <b>Workspace Archive:</b> <code>%s</code>\n📄 %d file(s) · %s",
+			escapeTelegram(filepath.Base(targetDir)), count, formatByteSize(zipSize))
+		if _, err := bot.SendDocument(chatID, zipPath, caption); err != nil {
+			bot.SendMessage(chatID, fmt.Sprintf("❌ Failed to send ZIP archive: %v", err))
+		}
+
 	case strings.HasPrefix(data, "dir:cd:"):
 		rawTarget := strings.TrimPrefix(data, "dir:cd:")
 		targetDir := filepath.Clean(resolveDirToken(rawTarget))
@@ -693,6 +717,17 @@ func handleCallbackQuery(bot *TelegramBot, cq *CallbackQuery) {
 	case data == "action:continue":
 		_ = bot.AnswerCallbackQuery(cq.ID, "Continuing...")
 		go executeAgy(bot, userID, chatID, "Please continue where you left off.", false)
+
+	case data == "action:retry":
+		mu.RLock()
+		lastPrompt := state.LastUserPrompt
+		mu.RUnlock()
+		if lastPrompt == "" {
+			_ = bot.AnswerCallbackQuery(cq.ID, "ℹ️ No previous prompt to retry.")
+			return
+		}
+		_ = bot.AnswerCallbackQuery(cq.ID, "🔄 Retrying prompt...")
+		go executeAgy(bot, userID, chatID, lastPrompt, false)
 
 	case data == "action:compact":
 		_ = bot.AnswerCallbackQuery(cq.ID, "🧹 Compacting conversation context...")
@@ -849,6 +884,8 @@ func handleMessage(bot *TelegramBot, m *Message) {
 • <b>/dir [path]</b> — Browse &amp; switch working directory
 • <b>/files</b> — View code in-chat or 1-tap download files
 • <b>/find &lt;query&gt;</b> — Instant workspace filename &amp; text search
+• <b>/sh &lt;cmd&gt;</b> — Fast local shell command (0 LLM wait)
+• <b>/export</b> — Download current workspace as a clean ZIP archive
 • <b>/model [name]</b> — Switch active AI model (` + "<code>Gemini</code> / <code>Claude</code>" + `)
 • <b>/git</b> — Interactive Git status, diff, log, branches &amp; AI review
 • <b>/server</b> — Real-time RAM, CPU, disk &amp; battery health
@@ -920,6 +957,44 @@ func handleMessage(bot *TelegramBot, m *Message) {
 			mu.RUnlock()
 			text, markup := buildFindResultsKeyboard(curDir, args)
 			bot.SendMessageWithMarkup(m.Chat.ID, text, markup, "HTML")
+			return
+
+		case "/sh", "/cmd", "/exec":
+			if args == "" {
+				bot.SendMessage(m.Chat.ID, "💻 Please specify a shell command to run (e.g. <code>/sh go test ./...</code>).", "HTML")
+				return
+			}
+			mu.RLock()
+			curDir := state.WorkingDir
+			mu.RUnlock()
+			outHTML, kb, fixPrompt := runQuickShellCommand(curDir, args)
+			if fixPrompt != "" {
+				mu.Lock()
+				state.LastUserPrompt = fixPrompt
+				mu.Unlock()
+			}
+			bot.SendMessageWithMarkup(m.Chat.ID, outHTML, kb, "HTML")
+			return
+
+		case "/export", "/zip":
+			mu.RLock()
+			curDir := state.WorkingDir
+			mu.RUnlock()
+			if !isPathAllowed(curDir) {
+				bot.SendMessage(m.Chat.ID, "⛔ Current directory is outside sandbox paths.")
+				return
+			}
+			zipPath, count, zipSize, err := exportDirToZip(curDir)
+			if err != nil {
+				bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to create ZIP archive: %v", err))
+				return
+			}
+			defer os.Remove(zipPath)
+			caption := fmt.Sprintf("📦 <b>Workspace Archive:</b> <code>%s</code>\n📄 %d file(s) · %s",
+				escapeTelegram(filepath.Base(curDir)), count, formatByteSize(zipSize))
+			if _, err := bot.SendDocument(m.Chat.ID, zipPath, caption); err != nil {
+				bot.SendMessage(m.Chat.ID, fmt.Sprintf("❌ Failed to send ZIP archive: %v", err))
+			}
 			return
 
 		case "/quick", "/workflows":
@@ -1494,6 +1569,7 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 		state.TaskStartTime = time.Now()
 		state.ActiveStep = "Starting..."
 		state.ActiveThought = ""
+		state.LastUserPrompt = content
 	}
 
 	convID := state.ConversationID
@@ -1912,7 +1988,12 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 	// Handle cancellation
 	if ctx.Err() != nil {
 		if statusMsgID != 0 {
-			bot.EditMessageText(chatID, statusMsgID, "🛑 <b>Task cancelled.</b>", nil, "HTML")
+			retryKb := &InlineKeyboardMarkup{
+				InlineKeyboard: [][]InlineKeyboardButton{
+					{{Text: "🔄 Retry Last Prompt", CallbackData: "action:retry"}},
+				},
+			}
+			bot.EditMessageText(chatID, statusMsgID, "🛑 <b>Task cancelled.</b>", retryKb, "HTML")
 		}
 		return
 	}

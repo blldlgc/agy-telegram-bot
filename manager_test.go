@@ -138,6 +138,23 @@ func TestBuildDashboards(t *testing.T) {
 	if got := resolveModelArg("opus"); !strings.Contains(got, "Opus") {
 		t.Errorf("resolveModelArg('opus') = %q, expected Opus model", got)
 	}
+
+	outHTML, kb, fixPrompt := runQuickShellCommand(cwd, "echo hello_telegravity")
+	if !strings.Contains(outHTML, "hello_telegravity") || kb != nil || fixPrompt != "" {
+		t.Errorf("runQuickShellCommand success test failed: %s", outHTML)
+	}
+
+	failHTML, failKb, failPrompt := runQuickShellCommand(cwd, "exit 2")
+	if !strings.Contains(failHTML, "Failed") || failKb == nil || failPrompt == "" {
+		t.Errorf("runQuickShellCommand failure test failed: %s", failHTML)
+	}
+
+	zipPath, count, zipSize, err := exportDirToZip(cwd)
+	if err != nil || count == 0 || zipSize == 0 {
+		t.Errorf("exportDirToZip failed: err=%v, count=%d, size=%d", err, count, zipSize)
+	} else {
+		_ = os.Remove(zipPath)
+	}
 }
 
 func TestSymlinkSandboxProtection(t *testing.T) {

@@ -50,8 +50,10 @@ By bridging Antigravity CLI with **Telegram**, this project unlocks the ability 
     - `/dir [path]`: Paginated folder explorer to switch working directories.
     - `/files`: View code/text files in-chat with syntax highlighting (`👁️`) or 1-tap download (`📥`).
     - `/find <query>`: Instant local filename and code content search with View/Download buttons.
+    - `/sh <cmd>`: Run a fast local shell command in the working directory with a 1-tap `[🛠️ Ask AI to Fix Error]` button if it fails.
+    - `/export`: Package and download the current working directory as a clean `.zip` archive.
     - `/model [name]`: Select AI model via inline buttons or fuzzy name match (e.g. `/model opus`).
-    - `/git`: Interactive Git dashboard (status, diff stat, full diff, commit inspector, branch switcher, pull, AI review).
+    - `/git`: Interactive Git dashboard (status, diff stat, full diff, commit inspector, branch switcher, checkpoint commit, stash, pull, AI review).
     - `/server`: System health dashboard (RAM, CPU load, disk, battery, uptime, uploads cache cleaner).
     - `/review`: Run an AI code review on uncommitted Git changes.
     - `/tasks`: Inspect active task progress and queued messages.

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"context"
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -1038,18 +1040,161 @@ func buildDirKeyboard(currentDir string, allowed []string, page ...int) (string,
 		rows = append(rows, navRow)
 	}
 
-	// Quick file browser & git buttons
+	// Quick file browser, zip export & git buttons
 	rows = append(rows, []InlineKeyboardButton{
 		{Text: fmt.Sprintf("📄 Files (%d)", fileCount), CallbackData: fmt.Sprintf("file:list:%s:0", curToken)},
-		{Text: "🌿 Git Status", CallbackData: "git:status"},
+		{Text: "📦 Export ZIP", CallbackData: "dir:zip:" + curToken},
 	})
 
 	rows = append(rows, []InlineKeyboardButton{
 		{Text: "🌐 Root Folders", CallbackData: "dir:roots"},
+		{Text: "🌿 Git Status", CallbackData: "git:status"},
 		{Text: "🔄 Refresh", CallbackData: fmt.Sprintf("dir:page:%s:%d", curToken, curPage)},
 	})
 
 	return sb.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// exportDirToZip packages sourceDir into a clean .zip archive in uploads/ (skipping .git, node_modules, vendor, uploads, and huge binaries)
+func exportDirToZip(sourceDir string) (string, int, int64, error) {
+	cleanSrc := filepath.Clean(sourceDir)
+	dirName := filepath.Base(cleanSrc)
+	if dirName == "" || dirName == "." || dirName == "/" {
+		dirName = "workspace"
+	}
+	zipName := fmt.Sprintf("%s_%s.zip", dirName, time.Now().Format("20060102_150405"))
+	zipPath := filepath.Join(getUploadsDir(), zipName)
+
+	outFile, err := os.Create(zipPath)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	defer outFile.Close()
+
+	zw := zip.NewWriter(outFile)
+	fileCount := 0
+	var totalBytes int64
+	const maxSingleFile = 15 * 1024 * 1024 // 15 MB per file
+	const maxTotalBytes = 45 * 1024 * 1024 // 45 MB Telegram bot upload limit
+
+	err = filepath.WalkDir(cleanSrc, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		name := d.Name()
+		if d.IsDir() {
+			if path != cleanSrc && (name == ".git" || name == "node_modules" || name == "vendor" || name == "uploads" || name == ".idea" || name == ".vscode" || name == "__pycache__") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Skip compiled bot binary or existing zip archives in root
+		if name == "antigravity-bot" || strings.HasSuffix(name, ".zip") || strings.HasPrefix(name, ".sessions.json") || name == ".env" {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return nil
+		}
+		if info.Size() > maxSingleFile || totalBytes+info.Size() > maxTotalBytes {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(cleanSrc, path)
+		if err != nil {
+			return nil
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return nil
+		}
+		header.Name = filepath.ToSlash(relPath)
+		header.Method = zip.Deflate
+
+		writer, err := zw.CreateHeader(header)
+		if err != nil {
+			return nil
+		}
+		srcFile, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		n, copyErr := io.Copy(writer, srcFile)
+		srcFile.Close()
+		if copyErr == nil {
+			fileCount++
+			totalBytes += n
+		}
+		return nil
+	})
+	_ = zw.Close()
+	if err != nil {
+		return "", 0, 0, err
+	}
+	stat, err := os.Stat(zipPath)
+	var zipSize int64
+	if err == nil {
+		zipSize = stat.Size()
+	}
+	return zipPath, fileCount, zipSize, nil
+}
+
+// runQuickShellCommand executes a shell command directly in workDir with a 25s timeout
+func runQuickShellCommand(workDir string, cmdLine string) (string, *InlineKeyboardMarkup, string) {
+	cleanDir := filepath.Clean(workDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "bash", "-c", cmdLine)
+	cmd.Dir = cleanDir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+	durStr := fmt.Sprintf("%dms", elapsed.Milliseconds())
+	if elapsed >= time.Second {
+		durStr = fmt.Sprintf("%.1fs", elapsed.Seconds())
+	}
+
+	outStr := strings.TrimSpace(string(out))
+	if outStr == "" {
+		outStr = "(no output)"
+	}
+	if len([]rune(outStr)) > 3000 {
+		outStr = string([]rune(outStr)[:3000]) + "\n... (truncated)"
+	}
+
+	var sb strings.Builder
+	var kb *InlineKeyboardMarkup
+	var aiFixPrompt string
+
+	if err != nil {
+		sb.WriteString(fmt.Sprintf("❌ <b>Shell Command Failed</b> <i>(%s)</i>\n", durStr))
+		sb.WriteString(fmt.Sprintf("📂 <code>%s</code>\n💻 <code>$ %s</code>\n\n", escapeTelegram(shortenHomeDir(cleanDir)), escapeTelegram(cmdLine)))
+		sb.WriteString(fmt.Sprintf("<pre>%s</pre>\n", escapeTelegram(outStr)))
+		sb.WriteString(fmt.Sprintf("⚠️ <i>Error: %s</i>", escapeTelegram(err.Error())))
+
+		snippet := outStr
+		if len([]rune(snippet)) > 1500 {
+			snippet = string([]rune(snippet)[:1500])
+		}
+		aiFixPrompt = fmt.Sprintf("I ran `%s` in `%s` and it failed with:\n```\n%s\n```\nPlease diagnose and fix this issue.", cmdLine, cleanDir, snippet)
+		kb = &InlineKeyboardMarkup{
+			InlineKeyboard: [][]InlineKeyboardButton{
+				{
+					{Text: "🛠️ Ask AI to Fix Error", CallbackData: "action:retry"},
+				},
+			},
+		}
+	} else {
+		sb.WriteString(fmt.Sprintf("✅ <b>Shell Command Output</b> <i>(%s)</i>\n", durStr))
+		sb.WriteString(fmt.Sprintf("📂 <code>%s</code>\n💻 <code>$ %s</code>\n\n", escapeTelegram(shortenHomeDir(cleanDir)), escapeTelegram(cmdLine)))
+		sb.WriteString(fmt.Sprintf("<pre>%s</pre>", escapeTelegram(outStr)))
+	}
+
+	return sb.String(), kb, aiFixPrompt
 }
 
 // buildFilesKeyboard lists files in currentDir with 1-tap download buttons
@@ -1148,6 +1293,7 @@ func buildFilesKeyboard(currentDir string, page int) (string, *InlineKeyboardMar
 
 	rows = append(rows, []InlineKeyboardButton{
 		{Text: "📂 Back to Folders", CallbackData: registerDirToken(cleanCurrent)},
+		{Text: "📦 Export ZIP", CallbackData: "dir:zip:" + curToken},
 		{Text: "🔄 Refresh", CallbackData: fmt.Sprintf("file:list:%s:%d", curToken, page)},
 	})
 
@@ -1346,8 +1492,9 @@ func buildGitDashboard(dir string, action string) (string, *InlineKeyboardMarkup
 			{Text: "📥 Pull", CallbackData: "git:pull"},
 		},
 		{
-			{Text: "🔍 AI Code Review", CallbackData: "git:review"},
-			{Text: "📂 Dir Menu", CallbackData: "dir:open"},
+			{Text: "💾 Checkpoint", CallbackData: "git:checkpoint"},
+			{Text: "📦 Stash", CallbackData: "git:stash"},
+			{Text: "🔍 AI Review", CallbackData: "git:review"},
 		},
 	}
 
@@ -1518,6 +1665,31 @@ func buildGitDashboard(dir string, action string) (string, *InlineKeyboardMarkup
 			sb.WriteString(fmt.Sprintf("❌ <b>Git Pull Failed:</b>\n<pre>%s</pre>", escapeTelegram(pullStr)))
 		} else {
 			sb.WriteString(fmt.Sprintf("📥 <b>Git Pull Output:</b>\n<pre>%s</pre>", escapeTelegram(pullStr)))
+		}
+
+	case action == "checkpoint":
+		statusOut, _ := exec.Command("git", "-C", cleanDir, "status", "-s").CombinedOutput()
+		if strings.TrimSpace(string(statusOut)) == "" {
+			sb.WriteString("ℹ️ <b>Checkpoint:</b> Working tree is already clean (nothing to commit).")
+		} else {
+			_ = exec.Command("git", "-C", cleanDir, "add", "-A").Run()
+			msg := fmt.Sprintf("chore: telegram checkpoint (%s)", time.Now().Format("2006-01-02 15:04:05"))
+			commitOut, err := exec.Command("git", "-C", cleanDir, "commit", "-m", msg).CombinedOutput()
+			commitStr := strings.TrimSpace(string(commitOut))
+			if err != nil {
+				sb.WriteString(fmt.Sprintf("❌ <b>Checkpoint Commit Failed:</b>\n<pre>%s</pre>", escapeTelegram(commitStr)))
+			} else {
+				sb.WriteString(fmt.Sprintf("✅ <b>Local Checkpoint Created:</b>\n<pre>%s</pre>", escapeTelegram(commitStr)))
+			}
+		}
+
+	case action == "stash":
+		stashOut, err := exec.Command("git", "-C", cleanDir, "stash", "--include-untracked").CombinedOutput()
+		stashStr := strings.TrimSpace(string(stashOut))
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("❌ <b>Git Stash Failed:</b>\n<pre>%s</pre>", escapeTelegram(stashStr)))
+		} else {
+			sb.WriteString(fmt.Sprintf("📦 <b>Git Stash Output:</b>\n<pre>%s</pre>", escapeTelegram(stashStr)))
 		}
 
 	default: // "status"
