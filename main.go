@@ -867,12 +867,12 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 		}
 	}()
 
-	// Send initial status message
+	// Send initial status message WITHOUT ReplyKeyboardMarkup so Telegram allows EditMessageText!
 	initText := "⏳ <i>Antigravity is starting...</i>"
 	if isBackground {
 		initText = "⏳ <b>[Background]</b> Task initiated..."
 	}
-	statusMsg, err := bot.SendMessage(chatID, initText, "HTML")
+	statusMsg, err := bot.SendMessageWithMarkup(chatID, initText, nil, "HTML")
 	statusMsgID := int64(0)
 	if err == nil && statusMsg != nil {
 		statusMsgID = statusMsg.MessageID
@@ -997,7 +997,9 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 		lastStatusUpdate = time.Now()
 		lastSentStatus = newStatus
 		statusMu.Unlock()
-		_, _ = bot.EditMessageText(chatID, statusMsgID, newStatus, nil, "HTML")
+		if _, err := bot.EditMessageText(chatID, statusMsgID, newStatus, nil, "HTML"); err != nil && !strings.Contains(err.Error(), "message is not modified") {
+			log.Printf("updateStatus EditMessageText error: %v", err)
+		}
 	}
 
 	// Real-time transcript.jsonl watcher (captures exact thoughts and tool calls as agy writes them)
@@ -1286,7 +1288,9 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 		}
 		doneSb.WriteString(fmt.Sprintf("✅ <b>Task complete</b> <i>(took %s)</i>", durStr))
 		statusMu.Unlock()
-		_, _ = bot.EditMessageText(chatID, statusMsgID, doneSb.String(), nil, "HTML")
+		if _, err := bot.EditMessageText(chatID, statusMsgID, doneSb.String(), nil, "HTML"); err != nil && !strings.Contains(err.Error(), "message is not modified") {
+			log.Printf("final status EditMessageText error: %v", err)
+		}
 	}
 
 	// Format with new rock-solid Telegram HTML converter
