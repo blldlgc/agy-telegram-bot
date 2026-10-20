@@ -1,13 +1,13 @@
 [Unit]
-Description=Antigravity Telegram Bot Service
+Description=Telegravity - Antigravity CLI Telegram Bot Service
 After=network.target
 
 [Service]
 Type=simple
 User=<YOUR_USERNAME>
-# Lưu ý: Thay đổi WorkingDirectory và ExecStart thành đường dẫn đúng tới thư mục chứa mã nguồn của bạn
-WorkingDirectory=/path/to/your/projects/antigravity-cli-telegram
-ExecStart=/path/to/your/projects/antigravity-cli-telegram/antigravity-cli-telegram
+# Note: Update WorkingDirectory and ExecStart to match your installation directory
+WorkingDirectory=/path/to/your/projects/agy-telegram-bot
+ExecStart=/path/to/your/projects/agy-telegram-bot/antigravity-bot
 Restart=always
 RestartSec=5
 StandardOutput=syslog
@@ -18,3 +18,4 @@ Environment="PATH=/usr/local/bin:/usr/bin:/bin:/home/<YOUR_USERNAME>/.local/bin:
 
 [Install]
 WantedBy=multi-user.target
+

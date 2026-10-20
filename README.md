@@ -1,7 +1,5 @@
 # 🌌 Telegravity — A Telegram Bot for Antigravity CLI
 
-*[Đọc bản Tiếng Việt (Vietnamese version)](docs/README-vi.md)*
-
 **Telegravity** is a fast, lightweight Telegram Bot written in Golang, acting as an interactive remote gateway and live-streaming bridge for [Antigravity CLI](https://dev.to/arindam_1729/antigravity-cli-a-hands-on-guide-to-googles-terminal-coding-agent-5bc7). This version **operates independently**, not using any 3rd-party API wrappers to ensure maximum security, directly communicating with Telegram via RAW HTTP.
 
 This document provides a detailed guide on how to configure the Telegram Bot with BotFather, install, secure, and run the bot 24/7.
@@ -108,11 +106,12 @@ Telegram secures access via User ID (a numeric string). You need this ID to conf
 
 ### 2. Configuration
 
-Open a terminal at the root directory and execute:
+Clone the repository and configure your environment:
 
 ```bash
-# Navigate to the project directory
-cd antigravity-cli-telegram
+# Clone the repository
+git clone https://github.com/blldlgc/agy-telegram-bot.git
+cd agy-telegram-bot
 
 # Initialize libraries (only using godotenv)
 go mod tidy
@@ -133,18 +132,18 @@ ALLOWED_DIRS=/path/to/your/projects,/var/www/html
 
 ---
 
-## 🚀 Part 3: Running the Bot 24/7 on a Linux VPS
+## 🚀 Part 3: Running the Bot 24/7 on a Linux Server
 
-We will use **systemd** to keep the bot running in the background and automatically restart.
+We can use **systemd** (or `runit` / `termux-services` on Android/Termux) to keep the bot running in the background and automatically restart.
 
 ### First-time Deployment
 
-1. From the project's root directory (`antigravity-cli-telegram`), build the executable file:
+1. From the project's root directory (`agy-telegram-bot`), build the executable file:
 
    ```bash
-   go build .
+   go build -o antigravity-bot .
    ```
-1. Open the `antigravity-bot-tg.service` file (already in the directory) and check/edit the `WorkingDirectory` and `ExecStart` paths to match the actual directory on your VPS (default is `/path/to/your/projects/antigravity-cli-telegram`).
+1. Open the `antigravity-bot-tg.service` file and check/edit the `WorkingDirectory` and `ExecStart` paths to match the actual directory on your server (e.g., `/path/to/your/projects/agy-telegram-bot`).
 1. Install and start the service:
 
    ```bash
@@ -162,15 +161,14 @@ We will use **systemd** to keep the bot running in the background and automatica
 
 ### Updating when code changes
 
-When there's a new version or code change on Github, just follow these 3 simple steps on your VPS:
+When there's a new version or code change on GitHub, either run `/restart` directly from Telegram after building, or run:
 
 ```bash
 # 1. Pull the latest code
 git pull
 
 # 2. Rebuild the executable
-cd antigravity-cli-telegram
-go build -o antigravity-cli-telegram .
+go build -o antigravity-bot .
 
 # 3. Restart the service
 sudo systemctl restart antigravity-bot-tg

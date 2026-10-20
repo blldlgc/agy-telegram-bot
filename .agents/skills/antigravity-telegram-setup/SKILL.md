@@ -33,7 +33,7 @@ Do not ask the user to install Go or Antigravity CLI. You must install them your
 
 ### 3. Automated Compilation
 - Run `go mod tidy` to download dependencies.
-- Run `go build -o antigravity-cli-telegram .` to compile the standalone binary (or `antigravity-cli-telegram.exe` on Windows).
+- Run `go build -o antigravity-bot .` to compile the standalone binary (or `antigravity-bot.exe` on Windows).
 
 ### 4. Persistent Service Deployment
 - **Linux/Systemd (VPS)**: 
