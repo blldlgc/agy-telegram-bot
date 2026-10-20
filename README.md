@@ -29,17 +29,20 @@ By bridging Antigravity CLI with **Telegram**, this project unlocks the ability 
 - **Absolute Security**: API calls are made directly via standard `net/http` without 3rd-party wrappers.
 - **Sandbox Security 🛡️**: Restricts the AI to read/write files strictly within authorized directories (`ALLOWED_DIRS`).
 - **Access Control (Whitelist)**: Only responds to authorized Telegram user IDs or group chat IDs.
-- **Real-Time Live Updates & Push Alerts ⚡**: Streams tool execution steps live into Telegram (`⚡ Running: [tool]`), and delivers the completed result as a new message to guarantee mobile push notifications and vibration.
+- **Real-Time Step History & Push Alerts ⚡**: Streams a live checklist of completed (`✅`) and active (`⚡ Running:`) tool steps into Telegram, and delivers the final response as a new message to guarantee mobile push notifications and vibration.
+- **Smart Message Queueing 📥**: Send follow-up prompts even while the bot is busy—messages are automatically queued and executed in order, with inline buttons to `[⚡ Interrupt & Run Now]` or `[🗑️ Clear Queue]`.
+- **Instant Git Dashboard 🌿**: Check repository status, unstaged diff stats, recent commits, and trigger `git pull` instantaneously via `/git` without waiting for an LLM turn.
 - **Continuous Typing Indicator ✍️**: Maintains active typing status during lengthy reasoning turns.
 - **Dynamic AI Model Switcher 🧠**: Switch models (`Gemini 3.8 Flash`, `Gemini 4 Argon`, `Claude Sonnet/Opus`) on the fly via `/model` with inline buttons.
-- **Bi-Directional File & Photo Support 🖼️📁**: Upload source code, documents, or screenshots/photos directly via Telegram for the AI agent to inspect, or download server files to Telegram using `/getfile <path>`.
-- **Persistent Mobile Reply Keyboard 📱**: Quick bottom buttons (`Status`, `Dir`, `Model`, `Resume`, `New`, `Cancel`, `Restart`) designed for seamless phone ergonomics.
+- **Bi-Directional File, Photo & Auto-Attachment Support 🖼️📁**: Upload source code, documents, or screenshots/photos directly via Telegram for the AI agent to inspect, download server files via `/getfile <path>`, or let the agent automatically deliver generated PDFs, reports, and images to your chat.
+- **Persistent Mobile Reply Keyboard 📱**: Quick bottom buttons (`Status`, `Dir`, `Model`, `Continue`, `Resume`, `New`, `Git`, `Cancel`) designed for seamless phone ergonomics.
 - **Instant Task Cancellation 🛑**: Stop long-running or stuck tasks immediately with `/cancel` or `/stop`.
 - **Interactive Session Management 💬**: Browse recent conversations with message previews from the SQLite/transcript store and resume sessions interactively via inline buttons (`/resume`).
 - **Interactive Directory Browser 📂**: Navigate folders and switch working directories using interactive inline keyboards (`/dir`).
 - **Robust Markdown/HTML Formatting**: Custom tag-preserving parser and chunker that safely handles code blocks, nested tags, and message splits without Telegram parse errors.
 - **Slash Commands**:
     - `/model`: Select and switch active AI model interactively.
+    - `/git`: Open interactive Git dashboard (status, diff, log, pull).
     - `/getfile <path>`: Download a file from server to Telegram.
     - `/new`: Reset session and start a clean conversation.
     - `/resume`: List previous sessions with interactive buttons to switch.

@@ -117,6 +117,7 @@ func getDefaultReplyKeyboard() *ReplyKeyboardMarkup {
 				{Text: "✨ New"},
 			},
 			{
+				{Text: "🌿 Git"},
 				{Text: "🛑 Cancel"},
 			},
 		},
@@ -522,3 +523,90 @@ func buildRootsKeyboard(allowed []string) (string, *InlineKeyboardMarkup) {
 
 	return text, &InlineKeyboardMarkup{InlineKeyboard: rows}
 }
+
+// buildGitDashboard runs fast local git commands in dir and returns an interactive status card
+func buildGitDashboard(dir string, action string) (string, *InlineKeyboardMarkup) {
+	cleanDir := filepath.Clean(dir)
+	displayDir := shortenHomeDir(cleanDir)
+
+	kb := &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{
+			{
+				{Text: "🔄 Status", CallbackData: "git:status"},
+				{Text: "📊 Diff Stat", CallbackData: "git:diff"},
+			},
+			{
+				{Text: "📜 Recent Commits", CallbackData: "git:log"},
+				{Text: "📥 Git Pull", CallbackData: "git:pull"},
+			},
+		},
+	}
+
+	checkCmd := exec.Command("git", "-C", cleanDir, "rev-parse", "--is-inside-work-tree")
+	if out, err := checkCmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "true") {
+		return fmt.Sprintf("🌿 <b>Git Dashboard</b>\n📂 <code>%s</code>\n\nℹ️ <i>This directory is not a Git repository.</i>", escapeTelegram(displayDir)), kb
+	}
+
+	branchOut, _ := exec.Command("git", "-C", cleanDir, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	branch := strings.TrimSpace(string(branchOut))
+	if branch == "" {
+		branch = "detached/none"
+	}
+
+	lastCommitOut, _ := exec.Command("git", "-C", cleanDir, "log", "-1", "--pretty=format:%h — %s (%cr)").Output()
+	lastCommit := strings.TrimSpace(string(lastCommitOut))
+	if lastCommit == "" {
+		lastCommit = "No commits yet"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("🌿 <b>Git Repository Dashboard</b>\n")
+	sb.WriteString(fmt.Sprintf("📂 <b>Dir:</b> <code>%s</code>\n", escapeTelegram(displayDir)))
+	sb.WriteString(fmt.Sprintf("🔀 <b>Branch:</b> <code>%s</code>\n", escapeTelegram(branch)))
+	sb.WriteString(fmt.Sprintf("📝 <b>Latest:</b> <code>%s</code>\n\n", escapeTelegram(lastCommit)))
+
+	switch action {
+	case "diff":
+		diffOut, _ := exec.Command("git", "-C", cleanDir, "diff", "--stat").CombinedOutput()
+		diffStr := strings.TrimSpace(string(diffOut))
+		if diffStr == "" {
+			diffStr = "No unstaged line changes."
+		}
+		if len([]rune(diffStr)) > 2500 {
+			diffStr = string([]rune(diffStr)[:2500]) + "\n..."
+		}
+		sb.WriteString("📊 <b>Diff Summary (Unstaged):</b>\n")
+		sb.WriteString(fmt.Sprintf("<pre>%s</pre>", escapeTelegram(diffStr)))
+
+	case "log":
+		logOut, _ := exec.Command("git", "-C", cleanDir, "log", "-n", "6", "--pretty=format:• %h — %s (%cr)").CombinedOutput()
+		logStr := strings.TrimSpace(string(logOut))
+		if logStr == "" {
+			logStr = "No commit history found."
+		}
+		sb.WriteString("📜 <b>Recent Commits:</b>\n")
+		sb.WriteString(fmt.Sprintf("<pre>%s</pre>", escapeTelegram(logStr)))
+
+	case "pull":
+		pullOut, err := exec.Command("git", "-C", cleanDir, "pull", "--ff-only").CombinedOutput()
+		pullStr := strings.TrimSpace(string(pullOut))
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("❌ <b>Git Pull Failed:</b>\n<pre>%s</pre>", escapeTelegram(pullStr)))
+		} else {
+			sb.WriteString(fmt.Sprintf("📥 <b>Git Pull Output:</b>\n<pre>%s</pre>", escapeTelegram(pullStr)))
+		}
+
+	default: // "status"
+		statusOut, _ := exec.Command("git", "-C", cleanDir, "status", "-s").CombinedOutput()
+		statusStr := strings.TrimSpace(string(statusOut))
+		if statusStr == "" {
+			sb.WriteString("✨ <b>Working Tree:</b> Clean (no modified or untracked files)")
+		} else {
+			sb.WriteString("📋 <b>Working Tree Changes:</b>\n")
+			sb.WriteString(fmt.Sprintf("<pre>%s</pre>", escapeTelegram(statusStr)))
+		}
+	}
+
+	return sb.String(), kb
+}
+
