@@ -957,6 +957,8 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 	var statusMu sync.Mutex
 	var stepHistory []string
 	var currentActiveStep string
+	var currentThought string
+	var lastSentStatus string
 
 	renderLiveSteps := func(preparing bool) string {
 		var sb strings.Builder
@@ -972,26 +974,146 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 		if preparing {
 			sb.WriteString("\n✍️ <i>Preparing final response...</i>")
 		} else if currentActiveStep != "" {
-			sb.WriteString("\n⚡ <b>Running:</b> " + currentActiveStep)
+			sb.WriteString("\n⚡ <b>Active:</b> " + currentActiveStep)
+		} else {
+			sb.WriteString("🧠 <i>Thinking...</i>")
+		}
+		if currentThought != "" && !preparing {
+			sb.WriteString(fmt.Sprintf("\n💭 <i>%s</i>", escapeTelegram(currentThought)))
 		}
 		return sb.String()
 	}
 
 	updateStatus := func(newStatus string) {
 		statusMu.Lock()
-		defer statusMu.Unlock()
-		if statusMsgID == 0 {
+		if statusMsgID == 0 || newStatus == lastSentStatus {
+			statusMu.Unlock()
 			return
 		}
-		if time.Since(lastStatusUpdate) < 1500*time.Millisecond {
+		if time.Since(lastStatusUpdate) < 900*time.Millisecond {
+			statusMu.Unlock()
 			return
 		}
 		lastStatusUpdate = time.Now()
+		lastSentStatus = newStatus
+		statusMu.Unlock()
 		_, _ = bot.EditMessageText(chatID, statusMsgID, newStatus, nil, "HTML")
 	}
 
+	// Real-time transcript.jsonl watcher (captures exact thoughts and tool calls as agy writes them)
+	var initTranscriptPath string
+	var transcriptOffset int64
+	if convID != "" {
+		initTranscriptPath = getTranscriptPathForConv(convID)
+		if info, err := os.Stat(initTranscriptPath); err == nil {
+			transcriptOffset = info.Size()
+		}
+	}
+
+	stopWatcher := make(chan struct{})
+	go func() {
+		tPath := initTranscriptPath
+		offset := transcriptOffset
+		ticker := time.NewTicker(800 * time.Millisecond)
+		defer ticker.Stop()
+
+		switchedToThinking := false
+		for {
+			select {
+			case <-stopWatcher:
+				return
+			case <-ticker.C:
+				if tPath == "" {
+					statusMu.Lock()
+					cid := capturedConvID
+					statusMu.Unlock()
+					if cid != "" {
+						tPath = getTranscriptPathForConv(cid)
+					} else {
+						foundID, foundPath := findNewestTranscriptPath(startTime)
+						if foundPath != "" {
+							tPath = foundPath
+							statusMu.Lock()
+							if capturedConvID == "" {
+								capturedConvID = foundID
+							}
+							statusMu.Unlock()
+						}
+					}
+				}
+
+				updated := false
+				if tPath != "" {
+					if f, err := os.Open(tPath); err == nil {
+						if info, err := f.Stat(); err == nil && info.Size() > offset {
+							_, _ = f.Seek(offset, 0)
+							sc := bufio.NewScanner(f)
+							buf := make([]byte, 512*1024)
+							sc.Buffer(buf, 5*1024*1024)
+							for sc.Scan() {
+								line := sc.Text()
+								if !strings.HasPrefix(line, "{") {
+									continue
+								}
+								var tStep struct {
+									Type      string `json:"type"`
+									Thinking  string `json:"thinking"`
+									ToolCalls []struct {
+										Name string                 `json:"name"`
+										Args map[string]interface{} `json:"args"`
+									} `json:"tool_calls"`
+								}
+								if json.Unmarshal([]byte(line), &tStep) == nil && tStep.Type == "PLANNER_RESPONSE" {
+									statusMu.Lock()
+									if tStep.Thinking != "" {
+										if th := extractThinkingSnippet(tStep.Thinking); th != "" {
+											currentThought = th
+											updated = true
+										}
+									}
+									for _, tc := range tStep.ToolCalls {
+										if tc.Name == "" {
+											continue
+										}
+										label := formatTranscriptToolCall(tc.Name, tc.Args)
+										if currentActiveStep != "" && currentActiveStep != label {
+											stepHistory = append(stepHistory, currentActiveStep)
+										}
+										currentActiveStep = label
+										updated = true
+									}
+									statusMu.Unlock()
+								}
+							}
+							offset = info.Size()
+						}
+						_ = f.Close()
+					}
+				}
+
+				if updated {
+					statusMu.Lock()
+					progressText := renderLiveSteps(false)
+					statusMu.Unlock()
+					updateStatus(progressText)
+				} else if !switchedToThinking && time.Since(startTime) > 1500*time.Millisecond {
+					switchedToThinking = true
+					statusMu.Lock()
+					progressText := renderLiveSteps(false)
+					statusMu.Unlock()
+					updateStatus(progressText)
+				}
+			}
+		}
+	}()
+	defer close(stopWatcher)
+
+	var streamWg sync.WaitGroup
+	streamWg.Add(2)
+
 	// Read stdout stream
 	go func() {
+		defer streamWg.Done()
 		scanner := bufio.NewScanner(stdout)
 		// Increase buffer size for large NDJSON lines
 		buf := make([]byte, 1024*1024)
@@ -1011,34 +1133,25 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 			}
 
 			if payload.ConversationID != "" {
+				statusMu.Lock()
 				capturedConvID = payload.ConversationID
+				statusMu.Unlock()
 			}
 
-			if payload.Event == "step_update" && payload.StepUpdate != nil {
+			if payload.Event == "init" {
+				statusMu.Lock()
+				progressText := renderLiveSteps(false)
+				statusMu.Unlock()
+				updateStatus(progressText)
+			} else if payload.Event == "step_update" && payload.StepUpdate != nil {
 				su := payload.StepUpdate
-				if su.State == "ACTIVE" {
-					if su.StepType == "tool" {
+				if su.State == "ACTIVE" || su.State == "STATE_ACTIVE" {
+					if su.StepType == "tool" || su.ToolName != "" || su.ToolInfo.Name != "" {
 						toolName := su.ToolName
 						if toolName == "" && su.ToolInfo.Name != "" {
 							toolName = su.ToolInfo.Name
 						}
-						detail := ""
-						if cmdLine, ok := su.ToolInfo.Parameters["CommandLine"].(string); ok {
-							detail = truncateStr(cmdLine, 40)
-						} else if path, ok := su.ToolInfo.Parameters["TargetFile"].(string); ok {
-							detail = truncateStr(filepath.Base(path), 35)
-						} else if path, ok := su.ToolInfo.Parameters["AbsolutePath"].(string); ok {
-							detail = truncateStr(filepath.Base(path), 35)
-						} else if path, ok := su.ToolInfo.Parameters["Path"].(string); ok {
-							detail = truncateStr(filepath.Base(path), 35)
-						} else if q, ok := su.ToolInfo.Parameters["query"].(string); ok {
-							detail = truncateStr(q, 35)
-						}
-
-						stepLabel := fmt.Sprintf("<code>[%s]</code>", escapeTelegram(toolName))
-						if detail != "" {
-							stepLabel = fmt.Sprintf("<code>[%s]</code> <i>%s</i>", escapeTelegram(toolName), escapeTelegram(detail))
-						}
+						stepLabel := formatTranscriptToolCall(toolName, su.ToolInfo.Parameters)
 
 						statusMu.Lock()
 						if currentActiveStep != "" && currentActiveStep != stepLabel {
@@ -1049,7 +1162,7 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 						statusMu.Unlock()
 
 						updateStatus(progressText)
-					} else if su.StepType == "agent_response" {
+					} else if su.StepType == "agent_response" || su.StepType == "planner_response" {
 						statusMu.Lock()
 						if currentActiveStep != "" {
 							stepHistory = append(stepHistory, currentActiveStep)
@@ -1064,7 +1177,9 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 			} else if payload.Event == "result" && payload.Result != nil {
 				finalResponse = payload.Result.Response
 				if payload.Result.ConversationID != "" {
+					statusMu.Lock()
 					capturedConvID = payload.Result.ConversationID
+					statusMu.Unlock()
 				}
 			}
 		}
@@ -1073,12 +1188,14 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 	// Read stderr in background
 	var stderrOutput strings.Builder
 	go func() {
+		defer streamWg.Done()
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			stderrOutput.WriteString(scanner.Text() + "\n")
 		}
 	}()
 
+	streamWg.Wait()
 	err = cmd.Wait()
 
 	// Handle cancellation
@@ -1209,6 +1326,12 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 	}
 
 	// Automatically send any files requested via <SEND_FILE>
+	homeDir, _ := os.UserHomeDir()
+	brainDir := ""
+	if homeDir != "" {
+		brainDir = filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain")
+	}
+
 	for _, rawPath := range filesToSend {
 		var targetPath string
 		if filepath.IsAbs(rawPath) {
@@ -1217,7 +1340,7 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 			targetPath = filepath.Clean(filepath.Join(workDir, rawPath))
 		}
 
-		isAllowed := isSubDir(uploadsDir, targetPath)
+		isAllowed := isSubDir(uploadsDir, targetPath) || (brainDir != "" && isSubDir(brainDir, targetPath))
 		if !isAllowed {
 			for _, ad := range allowedDirs {
 				if isSubDir(ad, targetPath) {

@@ -610,3 +610,138 @@ func buildGitDashboard(dir string, action string) (string, *InlineKeyboardMarkup
 	return sb.String(), kb
 }
 
+// cleanArgStr extracts a clean string value from transcript tool_calls args
+func cleanArgStr(args map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := args[k]; ok && v != nil {
+			s := fmt.Sprintf("%v", v)
+			s = strings.TrimSpace(strings.Trim(s, `"`))
+			if s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// formatTranscriptToolCall produces a human-readable HTML summary of a tool call
+func formatTranscriptToolCall(name string, args map[string]interface{}) string {
+	switch name {
+	case "read_file", "view_file":
+		p := cleanArgStr(args, "Path", "AbsolutePath", "TargetFile", "file_path")
+		if p != "" {
+			return fmt.Sprintf("📖 Reading <code>%s</code>", escapeTelegram(filepath.Base(p)))
+		}
+		return "📖 Reading file"
+
+	case "edit_file", "replace_file_content", "multi_replace_file_content":
+		p := cleanArgStr(args, "Path", "TargetFile", "file_path")
+		if p != "" {
+			return fmt.Sprintf("✏️ Editing <code>%s</code>", escapeTelegram(filepath.Base(p)))
+		}
+		return "✏️ Editing file"
+
+	case "write_file", "create_file":
+		p := cleanArgStr(args, "Path", "TargetFile", "file_path")
+		if p != "" {
+			return fmt.Sprintf("📝 Writing <code>%s</code>", escapeTelegram(filepath.Base(p)))
+		}
+		return "📝 Writing file"
+
+	case "run_command":
+		summary := cleanArgStr(args, "toolSummary", "toolAction")
+		cmdLine := cleanArgStr(args, "CommandLine", "command_line")
+		if summary != "" && cmdLine != "" {
+			return fmt.Sprintf("💻 <i>%s</i> (<code>%s</code>)", escapeTelegram(truncateStr(summary, 35)), escapeTelegram(truncateStr(cmdLine, 35)))
+		} else if summary != "" {
+			return fmt.Sprintf("💻 <i>%s</i>", escapeTelegram(truncateStr(summary, 45)))
+		} else if cmdLine != "" {
+			return fmt.Sprintf("💻 Running <code>%s</code>", escapeTelegram(truncateStr(cmdLine, 40)))
+		}
+		return "💻 Running command"
+
+	case "search_web":
+		q := cleanArgStr(args, "query")
+		if q != "" {
+			return fmt.Sprintf("🌐 Searching web: <i>%s</i>", escapeTelegram(truncateStr(q, 35)))
+		}
+		return "🌐 Searching web"
+
+	case "manage_task":
+		return "⏳ Checking background task"
+
+	case "grep_search", "find_by_name", "find_file", "search_directory":
+		q := cleanArgStr(args, "Query", "Pattern", "query")
+		if q != "" {
+			return fmt.Sprintf("🔍 Searching: <code>%s</code>", escapeTelegram(truncateStr(q, 35)))
+		}
+		return "🔍 Searching files"
+
+	default:
+		return fmt.Sprintf("🔧 <code>%s</code>", escapeTelegram(name))
+	}
+}
+
+// extractThinkingSnippet returns a concise 1-line summary of the model's current thought
+func extractThinkingSnippet(thinking string) string {
+	thinking = strings.TrimSpace(thinking)
+	if thinking == "" {
+		return ""
+	}
+	lines := strings.Split(thinking, "\n")
+	var lastNonEmpty string
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed != "" {
+			lastNonEmpty = trimmed
+		}
+	}
+	if lastNonEmpty == "" {
+		return ""
+	}
+	return truncateStr(lastNonEmpty, 90)
+}
+
+// getTranscriptPathForConv returns the path to transcript.jsonl for a conversation ID
+func getTranscriptPathForConv(convID string) string {
+	if convID == "" {
+		return ""
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain", convID, ".system_generated", "logs", "transcript.jsonl")
+}
+
+// findNewestTranscriptPath finds the most recently modified transcript.jsonl in brain/
+func findNewestTranscriptPath(since time.Time) (string, string) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", ""
+	}
+	brainDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "brain")
+	entries, err := os.ReadDir(brainDir)
+	if err != nil {
+		return "", ""
+	}
+	var bestConvID, bestPath string
+	var bestTime time.Time
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		p := filepath.Join(brainDir, e.Name(), ".system_generated", "logs", "transcript.jsonl")
+		info, err := os.Stat(p)
+		if err == nil && info.ModTime().After(since.Add(-2*time.Second)) {
+			if bestPath == "" || info.ModTime().After(bestTime) {
+				bestTime = info.ModTime()
+				bestConvID = e.Name()
+				bestPath = p
+			}
+		}
+	}
+	return bestConvID, bestPath
+}
+
+
