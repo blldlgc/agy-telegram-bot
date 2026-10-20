@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,8 +11,34 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+var (
+	dirTokenMu  sync.RWMutex
+	dirTokenMap = make(map[string]string)
+)
+
+func registerDirToken(fullPath string) string {
+	clean := filepath.Clean(fullPath)
+	h := sha1.Sum([]byte(clean))
+	token := fmt.Sprintf("%x", h[:6])
+	dirTokenMu.Lock()
+	dirTokenMap[token] = clean
+	dirTokenMu.Unlock()
+	return "dir:cd:" + token
+}
+
+func resolveDirToken(tokenOrPath string) string {
+	dirTokenMu.RLock()
+	p, ok := dirTokenMap[tokenOrPath]
+	dirTokenMu.RUnlock()
+	if ok {
+		return p
+	}
+	return tokenOrPath
+}
 
 type ConversationSummary struct {
 	ID           string
@@ -133,7 +160,7 @@ func buildActionKeyboard() *InlineKeyboardMarkup {
 		InlineKeyboard: [][]InlineKeyboardButton{
 			{
 				{Text: "🔄 Continue", CallbackData: "action:continue"},
-				{Text: "📁 Dir", CallbackData: "dir:roots"},
+				{Text: "📁 Dir", CallbackData: "dir:open"},
 				{Text: "✨ New Session", CallbackData: "resume:new"},
 			},
 		},
@@ -459,7 +486,7 @@ func buildDirKeyboard(currentDir string, allowed []string) (string, *InlineKeybo
 	}
 	if parentAllowed && parentDir != cleanCurrent {
 		rows = append(rows, []InlineKeyboardButton{
-			{Text: "📁 .. (Parent Directory)", CallbackData: fmt.Sprintf("dir:cd:%s", parentDir)},
+			{Text: "📁 .. (Parent Directory)", CallbackData: registerDirToken(parentDir)},
 		})
 	}
 
@@ -485,7 +512,7 @@ func buildDirKeyboard(currentDir string, allowed []string) (string, *InlineKeybo
 			}
 			currentRow = append(currentRow, InlineKeyboardButton{
 				Text:         btnText,
-				CallbackData: fmt.Sprintf("dir:cd:%s", fullSub),
+				CallbackData: registerDirToken(fullSub),
 			})
 			if len(currentRow) == 2 {
 				rows = append(rows, currentRow)
@@ -499,7 +526,7 @@ func buildDirKeyboard(currentDir string, allowed []string) (string, *InlineKeybo
 
 	rows = append(rows, []InlineKeyboardButton{
 		{Text: "🌐 Root Folders", CallbackData: "dir:roots"},
-		{Text: "🔄 Refresh", CallbackData: fmt.Sprintf("dir:cd:%s", cleanCurrent)},
+		{Text: "🔄 Refresh", CallbackData: registerDirToken(cleanCurrent)},
 	})
 
 	return sb.String(), &InlineKeyboardMarkup{InlineKeyboard: rows}
@@ -516,7 +543,7 @@ func buildRootsKeyboard(allowed []string) (string, *InlineKeyboardMarkup) {
 		rows = append(rows, []InlineKeyboardButton{
 			{
 				Text:         btnText,
-				CallbackData: fmt.Sprintf("dir:cd:%s", cleanAd),
+				CallbackData: registerDirToken(cleanAd),
 			},
 		})
 	}

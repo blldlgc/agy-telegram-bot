@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -253,6 +254,7 @@ func (b *TelegramBot) SendMessageWithMarkup(chatID int64, text string, markup in
 		return nil, err
 	}
 	if !apiResp.Ok {
+		log.Printf("⚠️ Telegram SendMessage failed: %s", apiResp.Description)
 		return nil, fmt.Errorf("telegram SendMessage failed: %s", apiResp.Description)
 	}
 
@@ -292,6 +294,7 @@ func (b *TelegramBot) EditMessageText(chatID int64, messageID int64, text string
 		return nil, err
 	}
 	if !apiResp.Ok {
+		log.Printf("⚠️ Telegram EditMessageText failed: %s", apiResp.Description)
 		return nil, fmt.Errorf("telegram EditMessageText failed: %s", apiResp.Description)
 	}
 

@@ -111,6 +111,8 @@ func main() {
 	}
 
 	log.Printf("Sandbox root dirs: %v", allowedDirs)
+	_, _ = buildDirKeyboard(defaultDir, allowedDirs)
+	_, _ = buildRootsKeyboard(allowedDirs)
 
 	bot := NewTelegramBot(token)
 	_ = bot.DeleteWebhook()
@@ -247,6 +249,16 @@ func handleCallbackQuery(bot *TelegramBot, cq *CallbackQuery) {
 			bot.EditMessageText(chatID, msgID, resp, nil, "HTML")
 		}
 
+	case data == "dir:open":
+		mu.RLock()
+		curDir := state.WorkingDir
+		mu.RUnlock()
+		text, markup := buildDirKeyboard(curDir, allowedDirs)
+		_ = bot.AnswerCallbackQuery(cq.ID, "📂 Directory menu")
+		if chatID != 0 && msgID != 0 {
+			bot.EditMessageText(chatID, msgID, text, markup, "HTML")
+		}
+
 	case data == "dir:roots":
 		text, markup := buildRootsKeyboard(allowedDirs)
 		_ = bot.AnswerCallbackQuery(cq.ID, "Root folders")
@@ -255,8 +267,8 @@ func handleCallbackQuery(bot *TelegramBot, cq *CallbackQuery) {
 		}
 
 	case strings.HasPrefix(data, "dir:cd:"):
-		targetDir := strings.TrimPrefix(data, "dir:cd:")
-		targetDir = filepath.Clean(targetDir)
+		rawTarget := strings.TrimPrefix(data, "dir:cd:")
+		targetDir := filepath.Clean(resolveDirToken(rawTarget))
 
 		isAllowed := false
 		for _, ad := range allowedDirs {
