@@ -1300,18 +1300,10 @@ func executeAgy(bot *TelegramBot, userID int64, chatID int64, content string, is
 	footer := fmt.Sprintf("\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n🤖 <i>%s</i> | 📂 <code>%s</code>", escapeTelegram(activeModel), escapeTelegram(shortenHomeDir(workDir)))
 	htmlContent += footer
 
-	// Add proactive notification alert header if long task or background
-	prefix := ""
-	if isBackground || elapsed > 15*time.Second {
-		prefix = fmt.Sprintf("🔔 <b>Task Complete!</b> <i>(Duration: %s)</i>\n\n", durStr)
-	}
-
 	chunks := SplitTelegramHTML(htmlContent, 3800)
 
 	// Send final response as NEW message (triggers Telegram push notification & sound on phone!)
 	if len(chunks) > 0 {
-		chunks[0] = prefix + chunks[0]
-
 		replyMarkup := getDefaultReplyKeyboard()
 		_, err := bot.SendMessageWithMarkup(chatID, chunks[0], replyMarkup, "HTML")
 		if err != nil {
